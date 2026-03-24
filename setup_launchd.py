@@ -22,6 +22,15 @@ LOG_DIR.mkdir(exist_ok=True)
 
 JOBS = [
     {
+        "label":   "com.baseballmodels.retrain",
+        "script":  BASE_DIR / "retrain_all.py",
+        "hour":    6,
+        "minute":  0,
+        "stdout":  LOG_DIR / "retrain_stdout.log",
+        "stderr":  LOG_DIR / "retrain_stderr.log",
+        "desc":    "Daily retrain (runs at 6am, pulls fresh data and retrains all 4 models)",
+    },
+    {
         "label":   "com.baseballmodels.scheduler",
         "script":  BASE_DIR / "schedule_daily.py",
         "hour":    8,
@@ -100,8 +109,9 @@ def install():
 
     print()
     print("  Daily schedule:")
-    print("    9:00 AM — grade yesterday's picks → post results to Discord")
+    print("    6:00 AM — pull fresh stats + retrain all 4 models")
     print("    8:00 AM — scheduler wakes, waits until T-90 before each game window")
+    print("    9:00 AM — grade yesterday's picks → post results to Discord")
     print("    T-90    — models run → SMS + Discord picks sent")
     print(f"\n  Logs: {LOG_DIR}/")
 
