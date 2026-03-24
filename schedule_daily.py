@@ -99,7 +99,7 @@ def run_models():
         log("run_daily.py completed successfully.")
 
 
-SEASON_START = datetime(2026, 3, 26).date()
+SEASON_START = datetime(2026, 3, 25).date()
 
 
 def main():

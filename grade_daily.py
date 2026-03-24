@@ -16,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from utils.tracker  import grade_picks
 from utils.notifier import send_graded_results
 
-SEASON_START  = datetime(2026, 3, 26)
+SEASON_START  = datetime(2026, 3, 25)
 yesterday_str = (datetime.now() - timedelta(days=1)).strftime("%Y%m%d")
 
 if datetime.now() < SEASON_START:
