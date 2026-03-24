@@ -1,0 +1,43 @@
+# ============================================================
+# Baseball Predictive Models - Python Package Requirements
+# ============================================================
+# Install all packages with:  pip install -r requirements.txt
+#
+# For R users new to Python:
+#   - pip is Python's package manager, similar to install.packages() in R
+#   - These packages extend Python's base capabilities, like R libraries
+# ============================================================
+
+# Core data manipulation (equivalent to tidyverse/dplyr in R)
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Baseball data retrieval from pybaseball
+# Wraps Baseball Savant, FanGraphs, and Baseball Reference APIs
+pybaseball>=2.2.7
+
+# Machine learning (XGBoost models for moneyline, hitter TB, pitcher outs)
+xgboost>=2.0.0
+scikit-learn>=1.3.0      # Model evaluation, preprocessing, train/test split
+
+# Statistical modeling (Poisson regression for totals)
+statsmodels>=0.14.0      # GLM with Poisson family - like glm(..., family=poisson) in R
+
+# HTTP requests (for weather API and optional odds API)
+requests>=2.31.0
+
+# Visualization (optional but useful for EDA)
+matplotlib>=3.7.0
+seaborn>=0.12.0
+
+# Model persistence (saving/loading trained models)
+joblib>=1.3.0            # Efficient model serialization - like saveRDS/readRDS in R
+
+# Progress bars for long-running data pulls
+tqdm>=4.65.0
+
+# Date/time utilities
+python-dateutil>=2.8.0
+
+# Browser automation (Action Network auto-login token refresh)
+playwright>=1.44.0

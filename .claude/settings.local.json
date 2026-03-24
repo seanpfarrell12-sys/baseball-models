@@ -1,0 +1,29 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(wc -l /Users/seanfarrell/baseball_models/**/*.py /Users/seanfarrell/baseball_models/requirements.txt)",
+      "WebSearch",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:actionnetworkhq.zendesk.com)",
+      "Bash(python3:*)",
+      "Bash(sed -i '' 's/train_mask = df\\\\[\"\"Season\"\"\\\\] < 2024/train_mask = df[\"\"Season\"\"] < 2025/' /Users/seanfarrell/baseball_models/totals/03_analysis_totals.py /Users/seanfarrell/baseball_models/hitter_tb/03_analysis_hitter_tb.py)",
+      "Bash(__NEW_LINE_071f505079c7b34f__ grep:*)",
+      "Bash(ls:*)",
+      "Bash(cat /Users/seanfarrell/baseball_models/exports/moneyline_edges_*.csv)",
+      "Bash(head -20 grep -n \"if __name__\\\\|pred_path\\\\|predictions\\\\|score_live\\\\|hitter_tb_pred\" /Users/seanfarrell/baseball_models/hitter_tb/04_export_hitter_tb.py)",
+      "Bash(grep -n \"Season\\\\|OBP\\\\|wOBA\\\\|ISO\\\\|BABIP\\\\|K%\\\\|BB%\\\\|SLG\\\\|wRC\\\\|HR\\\\|^H$\\\\|^AB\\\\|^G$\\\\|2B\\\\|3B\")",
+      "Bash(head -20 grep -n \"get_lineups\\\\|lineup_source\\\\|score_live_games\" /Users/seanfarrell/baseball_models/totals/04_export_totals.py)",
+      "Bash(head -20 grep -n \"pitcher_xstats\\\\|raw_pitcher_xstats\" /Users/seanfarrell/baseball_models/hitter_tb/01_input_hitter_tb.py)",
+      "Bash(head -20 grep -n \"pitcher_xstats\\\\|raw_pitcher_xstats\" /Users/seanfarrell/baseball_models/pitcher_outs/01_input_pitcher_outs.py)",
+      "Bash(head -20 grep -n \"minBFP\\\\|minPA\\\\|pitcher_xstats\\\\|pull_pitcher_xstats\" /Users/seanfarrell/baseball_models/hitter_tb/01_input_hitter_tb.py)",
+      "Bash(head -20 grep -n \"minBFP\\\\|minPA\\\\|pitcher_xstats\\\\|pull_pitcher_xstats\" /Users/seanfarrell/baseball_models/pitcher_outs/01_input_pitcher_outs.py)",
+      "Bash(cp /tmp/gh_install/gh_2.67.0_macOS_arm64/bin/gh ~/bin/gh)",
+      "Bash(mkdir -p ~/bin)",
+      "Bash(export PATH=\"$HOME/bin:$PATH\")",
+      "Bash(gh --version)",
+      "Bash(git init:*)",
+      "Bash(git add:*)",
+      "Bash(git rm:*)"
+    ]
+  }
+}

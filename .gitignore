@@ -1,0 +1,29 @@
+# Claude Code local settings
+.claude/
+
+# Credentials — never commit these
+utils/.an_credentials.json
+utils/.notifier_credentials.json
+tracking/changelog.json
+
+# Tracking data — personal performance log
+tracking/
+
+# Exported reports
+exports/
+
+# Logs
+logs/
+
+# Raw and processed data — large files, pulled by 01_input scripts
+data/raw/
+data/processed/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+
+# Environment
+.env
