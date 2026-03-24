@@ -728,6 +728,54 @@ def get_pitcher_outs_odds(game_date: str = None, token: str = None) -> pd.DataFr
     return df
 
 
+def get_nrfi_odds(game_date: str = None, token: str = None) -> pd.DataFrame:
+    """
+    Wrapper that returns NRFI/YRFI game-level odds in the format expected
+    by 04_export_nrfi.py.
+
+    NRFI/YRFI is a game-level market (not a player prop), so the prop_type
+    key depends on the bookmaker's labeling convention.  Common names:
+      "first_inning_score"     — DraftKings, FanDuel
+      "nrfi"                   — BetMGM, Caesars
+      "first_1_innings_score"  — some books
+
+    Returns columns:
+      home_team, away_team, game_date,
+      nrfi_over_juice, nrfi_under_juice,
+      nrfi_implied_prob   (= implied P(YRFI) from the under/nrfi side)
+    """
+    # Try multiple prop_type keys used by different books
+    for prop_key in ("nrfi", "first_inning_score", "first_1_innings_score"):
+        df = fetch_all_props_today(
+            prop_type=prop_key,
+            game_date=game_date,
+            token=token,
+        )
+        if not df.empty:
+            break
+
+    if df.empty:
+        return df
+
+    # Standardize column names
+    rename_map = {}
+    if "over_juice"  in df.columns:
+        rename_map["over_juice"]  = "nrfi_over_juice"    # YRFI side
+    if "under_juice" in df.columns:
+        rename_map["under_juice"] = "nrfi_under_juice"   # NRFI side
+    if rename_map:
+        df = df.rename(columns=rename_map)
+
+    # Compute book's implied P(YRFI) from the YRFI (over/yes) side
+    if "nrfi_over_juice" in df.columns:
+        df["nrfi_implied_prob"] = df["nrfi_over_juice"].apply(
+            lambda j: abs(j) / (abs(j) + 100) if j < 0
+                      else 100 / (j + 100)
+        )
+
+    return df
+
+
 # =============================================================================
 # DEBUG HELPER
 # =============================================================================

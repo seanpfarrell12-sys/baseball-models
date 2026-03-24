@@ -191,6 +191,7 @@ def save_picks(pick_date: str, results: dict):
         "Totals O/U":   _extract_totals,
         "Hitter TB":    _extract_hitter_tb,
         "Pitcher Outs": _extract_pitcher_outs,
+        "NRFI/YRFI":    _extract_nrfi,
     }
 
     new_rows = []
@@ -280,6 +281,24 @@ def _extract_pitcher_outs(r) -> dict:
     }
 
 
+def _extract_nrfi(r) -> dict:
+    game     = f"{r.get('away_team', '')} @ {r.get('home_team', '')}"
+    bet_side = str(r.get("bet_side", ""))
+    # model_prob is P(YRFI) for YRFI bets; P(NRFI) = 1 - P(YRFI) for NRFI bets
+    p_yrfi   = r.get("p_yrfi")
+    model_prob = p_yrfi if bet_side == "YRFI" else (1 - p_yrfi if p_yrfi is not None else None)
+    return {
+        "model":      "NRFI/YRFI",
+        "game":       game,
+        "subject":    game,   # game string doubles as the grading lookup key
+        "bet_type":   bet_side,
+        "line":       None,   # binary market — no numerical line
+        "odds":       r.get("bet_odds", 100),
+        "model_prob": model_prob,
+        "edge":       r.get("edge"),
+    }
+
+
 # =============================================================================
 # GRADE PICKS
 # =============================================================================
@@ -307,7 +326,7 @@ def grade_picks(grade_date: str) -> int:
     print(f"  (tracker) Grading {len(pending)} picks from {api_date}...")
 
     try:
-        game_scores, batter_tb, pitcher_outs_map = _fetch_mlb_results(api_date)
+        game_scores, batter_tb, pitcher_outs_map, nrfi_results = _fetch_mlb_results(api_date)
     except Exception as e:
         print(f"  (tracker) Could not fetch MLB results: {e}")
         return 0
@@ -321,7 +340,7 @@ def grade_picks(grade_date: str) -> int:
         row   = picks.loc[idx]
         model = row["model"]
         try:
-            result, actual = _grade_row(row, model, game_scores, batter_tb, pitcher_outs_map)
+            result, actual = _grade_row(row, model, game_scores, batter_tb, pitcher_outs_map, nrfi_results)
         except Exception as e:
             print(f"  (tracker) Error grading {model} pick '{row['subject']}': {e}")
             result, actual = "ERROR", None
@@ -339,7 +358,7 @@ def grade_picks(grade_date: str) -> int:
     return graded
 
 
-def _grade_row(row, model, game_scores, batter_tb, pitcher_outs_map):
+def _grade_row(row, model, game_scores, batter_tb, pitcher_outs_map, nrfi_results=None):
     """Return (result, actual_value) for a single pick row."""
     if model == "Moneyline":
         return _grade_moneyline(row, game_scores)
@@ -349,6 +368,8 @@ def _grade_row(row, model, game_scores, batter_tb, pitcher_outs_map):
         return _grade_prop(row, batter_tb)
     elif model == "Pitcher Outs":
         return _grade_prop(row, pitcher_outs_map)
+    elif model == "NRFI/YRFI":
+        return _grade_nrfi(row, nrfi_results or {})
     return "PENDING", None
 
 
@@ -415,6 +436,44 @@ def _grade_prop(row, stat_map):
     return result, actual
 
 
+def _grade_nrfi(row, nrfi_results: dict):
+    """
+    Grade a NRFI/YRFI pick.
+
+    nrfi_results keyed by (away_abbr, home_abbr) →
+      {"yrfi": 0|1, "away_1st": int, "home_1st": int}
+
+    bet_type = "YRFI" → WIN if yrfi==1, LOSS if yrfi==0
+    bet_type = "NRFI" → WIN if yrfi==0, LOSS if yrfi==1
+    No push possible (binary market).
+    """
+    game_str = str(row.get("subject", row.get("game", "")))
+    # Parse "ATL @ NYY" → away="ATL", home="NYY"
+    parts = [p.strip() for p in game_str.replace("@", " ").split()]
+    away, home = (parts[0], parts[-1]) if len(parts) >= 2 else ("", "")
+
+    key = _find_game_key_pair(away, home, nrfi_results)
+    if key is None:
+        return "PENDING", None
+
+    info     = nrfi_results[key]
+    yrfi     = info.get("yrfi", None)
+    if yrfi is None:
+        return "PENDING", None
+
+    actual_str = f"away_1st={info['away_1st']} home_1st={info['home_1st']}"
+    bet_type   = str(row.get("bet_type", "")).upper()
+
+    if bet_type == "YRFI":
+        result = "WIN" if yrfi == 1 else "LOSS"
+    elif bet_type == "NRFI":
+        result = "WIN" if yrfi == 0 else "LOSS"
+    else:
+        return "PENDING", None
+
+    return result, actual_str
+
+
 # =============================================================================
 # MLB STATS API
 # =============================================================================
@@ -426,8 +485,9 @@ def _fetch_mlb_results(api_date: str):
       game_scores   : {(away_abbr, home_abbr): {"home_runs", "away_runs"}}
       batter_tb     : {player_full_name: total_bases}
       pitcher_outs  : {pitcher_full_name: outs_recorded}
+      nrfi_results  : {(away_abbr, home_abbr): {"yrfi": 0|1, "away_1st": int, "home_1st": int}}
     """
-    # Step 1: get gamePks and final scores
+    # Step 1: get gamePks, final scores, and linescore (first-inning runs)
     resp = requests.get(
         MLB_SCHEDULE_URL,
         params={"sportId": 1, "date": api_date, "hydrate": "linescore"},
@@ -437,6 +497,7 @@ def _fetch_mlb_results(api_date: str):
     schedule = resp.json()
 
     game_scores  = {}
+    nrfi_results = {}
     final_pks    = []
 
     for date_entry in schedule.get("dates", []):
@@ -462,8 +523,24 @@ def _fetch_mlb_results(api_date: str):
             }
             final_pks.append(game["gamePk"])
 
+            # Extract first-inning runs from linescore
+            linescore = game.get("linescore", {})
+            innings   = linescore.get("innings", [])
+            away_1st  = 0
+            home_1st  = 0
+            for inn in innings:
+                if inn.get("num") == 1:
+                    away_1st = int(inn.get("away", {}).get("runs", 0) or 0)
+                    home_1st = int(inn.get("home", {}).get("runs", 0) or 0)
+                    break
+            nrfi_results[(away_abbr, home_abbr)] = {
+                "yrfi":     int(away_1st > 0 or home_1st > 0),
+                "away_1st": away_1st,
+                "home_1st": home_1st,
+            }
+
     if not final_pks:
-        return game_scores, {}, {}
+        return game_scores, {}, {}, nrfi_results
 
     # Step 2: fetch box scores for player stats
     batter_tb    = {}
@@ -499,7 +576,7 @@ def _fetch_mlb_results(api_date: str):
                 if ip_str is not None:
                     pitcher_outs[name] = _parse_outs(ip_str)
 
-    return game_scores, batter_tb, pitcher_outs
+    return game_scores, batter_tb, pitcher_outs, nrfi_results
 
 
 def _find_game_key(team_abbr: str, game_scores: dict):
@@ -555,7 +632,7 @@ def print_performance_summary(n_days: int = 30):
 
     totals_row = {"picks": 0, "w": 0, "l": 0, "p": 0, "pnl": 0.0}
 
-    for model in ["Moneyline", "Totals", "Hitter TB", "Pitcher Outs"]:
+    for model in ["Moneyline", "Totals", "Hitter TB", "Pitcher Outs", "NRFI/YRFI"]:
         sub = recent[recent["model"] == model]
         if sub.empty:
             continue

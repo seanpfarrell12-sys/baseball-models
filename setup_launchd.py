@@ -28,7 +28,7 @@ JOBS = [
         "minute":  0,
         "stdout":  LOG_DIR / "retrain_stdout.log",
         "stderr":  LOG_DIR / "retrain_stderr.log",
-        "desc":    "Daily retrain (runs at 6am, pulls fresh data and retrains all 4 models)",
+        "desc":    "Daily retrain (runs at 6am, pulls fresh data and retrains all 5 models)",
     },
     {
         "label":   "com.baseballmodels.scheduler",
@@ -109,7 +109,7 @@ def install():
 
     print()
     print("  Daily schedule:")
-    print("    6:00 AM — pull fresh stats + retrain all 4 models")
+    print("    6:00 AM — pull fresh stats + retrain all 5 models")
     print("    8:00 AM — scheduler wakes, waits until T-90 before each game window")
     print("    9:00 AM — grade yesterday's picks → post results to Discord")
     print("    T-90    — models run → SMS + Discord picks sent")

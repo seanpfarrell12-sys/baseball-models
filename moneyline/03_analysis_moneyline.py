@@ -1,57 +1,49 @@
 """
 =============================================================================
-MONEYLINE MODEL — FILE 3 OF 4: MODEL TRAINING AND SCORING
+MONEYLINE MODEL — FILE 3 OF 4: MODEL TRAINING AND SCORING  (REFACTORED)
 =============================================================================
-Purpose : Train XGBoost classifier on historical game data; score upcoming games.
-Input   : ../data/processed/moneyline_dataset.csv
-Output  : ../models/moneyline_model.json
-          ../data/processed/moneyline_predictions.csv (scored today's games)
+Trains an XGBoost classifier on the refactored feature set using
+walk-forward cross-validation to simulate real-world deployment.
 
-XGBoost for binary classification:
-  - Predicts P(home_team_wins) as a probability between 0.0 and 1.0
-  - Uses gradient boosting: each tree corrects errors of the previous one
-  - Handles missing values natively (no need for imputation)
-  - Objective: binary:logistic (= logistic regression output)
+Walk-forward CV folds:
+  Fold 1 : Train = 2023        →  Test = 2024
+  Fold 2 : Train = 2023+2024   →  Test = 2025
+  Final  : Train = all seasons →  Full model for 2026 scoring
 
-Model evaluation:
-  - Log Loss: measures calibration of probability predictions
-    (lower = better; a perfect calibrated model has log loss = 0)
-  - AUC-ROC: measures ranking ability (0.5 = random, 1.0 = perfect)
-  - Accuracy: simply % of games predicted correctly
-  - Brier Score: average squared error of probabilities (like MSE for probs)
+Model: XGBoost with isotonic probability calibration (CalibratedClassifierCV)
+  - Regularization: reg_alpha (L1), reg_lambda (L2), min_child_weight
+  - Objective: binary:logistic
+  - Calibration: isotonic regression on a holdout set
 
-R equivalent of this entire file:
-  library(xgboost)
-  dtrain <- xgb.DMatrix(data = as.matrix(X_train), label = y_train)
-  model  <- xgboost(dtrain, nrounds=200, objective="binary:logistic")
-  preds  <- predict(model, xgb.DMatrix(as.matrix(X_test)))
+Evaluation:
+  AUC-ROC   : discrimination ability (target > 0.54)
+  Log Loss  : probability calibration (target < 0.685)
+  Brier     : mean squared error of probabilities (target < 0.248)
+  Accuracy  : % games predicted correctly (target > 0.55)
 
-For R users learning Python:
-  - scikit-learn uses .fit(X, y) / .predict(X) convention
-  - Train/test split: train_test_split() = createDataPartition() in caret
-  - cross_val_score() = trainControl + train() in caret
-  - feature_importances_ = varImp() in caret
+Input  : data/processed/moneyline_dataset.csv
+Output : models/moneyline_model.json
+         models/moneyline_features.json
+         models/moneyline_metrics.json
+         models/moneyline_feature_importance.csv
 =============================================================================
 """
 
 import os
 import json
 import warnings
-import pandas as pd
 import numpy as np
-import joblib              # For saving/loading models (like saveRDS/readRDS in R)
+import pandas as pd
 import xgboost as xgb
-import matplotlib.pyplot as plt
 
-from sklearn.model_selection import train_test_split, cross_val_score, StratifiedKFold
+from sklearn.calibration   import CalibratedClassifierCV
+from sklearn.model_selection import train_test_split
 from sklearn.metrics import (
-    log_loss, roc_auc_score, accuracy_score, brier_score_loss, classification_report
+    roc_auc_score, log_loss, brier_score_loss, accuracy_score
 )
-from sklearn.preprocessing import StandardScaler
 
 warnings.filterwarnings("ignore")
 
-# --- Configuration ----------------------------------------------------------
 BASE_DIR   = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PROC_DIR   = os.path.join(BASE_DIR, "data", "processed")
 MODEL_DIR  = os.path.join(BASE_DIR, "models")
@@ -62,436 +54,294 @@ os.makedirs(EXPORT_DIR, exist_ok=True)
 
 
 # =============================================================================
-# FUNCTION 1: Load and Prepare Data
+# LOAD DATA
 # =============================================================================
 def load_data(path: str) -> tuple:
-    """
-    Load the processed moneyline dataset and split into features (X) and target (y).
-
-    In XGBoost, data is organized as:
-      X = feature matrix (all input columns)
-      y = target vector (home_win: 1 or 0)
-
-    This is identical to R's model formula approach, but explicit:
-      In R: formula = home_win ~ feature1 + feature2 + ...
-      In Python: X = df[feature_cols]; y = df["home_win"]
-
-    Returns
-    -------
-    tuple : (X, y, df, feature_cols)
-        X            : pd.DataFrame of features
-        y            : pd.Series of binary outcomes
-        df           : full DataFrame (for later joining with predictions)
-        feature_cols : list of feature column names
-    """
-    print(f"  Loading data from: {path}")
     df = pd.read_csv(path)
-    print(f"  ✓ {len(df):,} games loaded.")
+    print(f"  {len(df):,} games loaded across seasons: {sorted(df['season'].unique())}")
+    print(f"  Home win rate: {df['home_win'].mean():.3f}")
 
-    # Define feature columns — all numeric columns except IDs and target
-    exclude_cols = {
-        "game_date", "Season", "home_team", "away_team",
-        "home_win", "total_runs", "feature_season"
-    }
-    feature_cols = [c for c in df.columns if c not in exclude_cols
-                    and pd.api.types.is_numeric_dtype(df[c])]
-
-    print(f"  ✓ Features: {feature_cols}")
-    print(f"  ✓ Target: home_win (mean = {df['home_win'].mean():.3f})")
+    exclude = {"game_date", "season", "home_team", "away_team",
+               "home_win", "total_runs", "feature_season"}
+    feature_cols = [c for c in df.columns
+                    if c not in exclude and pd.api.types.is_numeric_dtype(df[c])]
 
     X = df[feature_cols].copy()
     y = df["home_win"].copy()
-
     return X, y, df, feature_cols
 
 
 # =============================================================================
-# FUNCTION 2: Time-Based Train/Validation Split
+# WALK-FORWARD CV
 # =============================================================================
-def time_split(df: pd.DataFrame, X: pd.DataFrame, y: pd.Series,
-               test_season: int = 2025) -> tuple:
+def walk_forward_cv(df: pd.DataFrame, X: pd.DataFrame,
+                    y: pd.Series, feature_cols: list) -> list:
     """
-    Split data by season to simulate real-world model validation.
+    Walk-forward validation across all seasons in the dataset.
 
-    IMPORTANT: In sports betting, you should NEVER randomly shuffle and split.
-    If you do, you get "look-ahead bias" — the model might learn from 2024
-    games to predict 2022 games, which is impossible in real deployment.
-
-    Correct approach: train on earlier seasons, test on the most recent season.
-      - Training set: 2022, 2023
-      - Test set: 2024
-    This mimics how you'd use the model in production (train → deploy next year).
-
-    R equivalent:
-      train_idx <- which(df$Season < 2024)
-      test_idx  <- which(df$Season == 2024)
-      X_train <- X[train_idx, ]; y_train <- y[train_idx]
-      X_test  <- X[test_idx, ];  y_test  <- y[test_idx]
-
-    Parameters
-    ----------
-    test_season : int
-        The season to hold out as test data.
-
-    Returns
-    -------
-    tuple : (X_train, X_test, y_train, y_test)
+    For each test season (from second to last), trains on all prior seasons
+    and evaluates on the test season.  Returns a list of per-fold metrics.
     """
-    if "Season" not in df.columns:
-        # Fallback to random split if no season column
-        print("  WARNING: No Season column — using random 80/20 split.")
-        return train_test_split(X, y, test_size=0.20, random_state=42, stratify=y)
+    seasons  = sorted(df["season"].unique())
+    if len(seasons) < 2:
+        print("  Need at least 2 seasons for walk-forward CV.")
+        return []
 
-    train_mask = df["Season"] < test_season
-    test_mask  = df["Season"] == test_season
+    fold_metrics = []
 
-    X_train = X[train_mask].copy()
-    X_test  = X[test_mask].copy()
-    y_train = y[train_mask].copy()
-    y_test  = y[test_mask].copy()
+    for i in range(1, len(seasons)):
+        test_season  = seasons[i]
+        train_mask   = df["season"] < test_season
+        test_mask    = df["season"] == test_season
 
-    print(f"  ✓ Training set: {len(X_train):,} games (seasons < {test_season})")
-    print(f"  ✓ Test set:     {len(X_test):,} games (season = {test_season})")
-    return X_train, X_test, y_train, y_test
+        X_train, y_train = X[train_mask], y[train_mask]
+        X_test,  y_test  = X[test_mask],  y[test_mask]
+
+        if len(X_train) < 100 or len(X_test) < 50:
+            continue
+
+        model = _train_xgb(X_train, y_train, X_test, y_test)
+        y_prob = model.predict_proba(X_test)[:, 1]
+        y_pred = (y_prob >= 0.5).astype(int)
+
+        m = {
+            "fold":       f"train<{test_season} / test={test_season}",
+            "n_train":    len(y_train),
+            "n_test":     len(y_test),
+            "auc":        round(roc_auc_score(y_test, y_prob), 4),
+            "log_loss":   round(log_loss(y_test, y_prob), 4),
+            "brier":      round(brier_score_loss(y_test, y_prob), 4),
+            "accuracy":   round(accuracy_score(y_test, y_pred), 4),
+        }
+        fold_metrics.append(m)
+
+        print(f"\n  Fold: {m['fold']}")
+        print(f"    Train {m['n_train']:,}  |  Test {m['n_test']:,}")
+        print(f"    AUC       {m['auc']:.4f}   (random=0.500)")
+        print(f"    Log Loss  {m['log_loss']:.4f}   (random=0.693)")
+        print(f"    Brier     {m['brier']:.4f}   (random=0.250)")
+        print(f"    Accuracy  {m['accuracy']:.4f}   (baseline≈0.540)")
+
+    return fold_metrics
 
 
 # =============================================================================
-# FUNCTION 3: Train XGBoost Model
+# TRAIN XGBoost (internal helper)
 # =============================================================================
-def train_xgboost(X_train: pd.DataFrame, y_train: pd.Series,
-                  X_test: pd.DataFrame, y_test: pd.Series) -> xgb.XGBClassifier:
-    """
-    Train an XGBoost classifier to predict P(home_team_wins).
-
-    XGBoost Hyperparameters (key ones to tune):
-    ─────────────────────────────────────────────────────────────────────
-    n_estimators    : Number of boosting rounds (trees). More = better fit,
-                      but risk of overfitting. Start with 200–500.
-    max_depth       : Max depth of each tree. Deeper = more complex interactions.
-                      For tabular data, 4–7 usually works well.
-    learning_rate   : Step size for each update. Lower = slower but more robust.
-                      Pair with more n_estimators when reducing this.
-    subsample       : Fraction of rows to sample per tree (reduces overfitting).
-    colsample_bytree: Fraction of COLUMNS to sample per tree (like mtry in R's rf).
-    reg_alpha/lambda: L1/L2 regularization (penalize large weights).
-    scale_pos_weight: Handles class imbalance. Set to (neg_count / pos_count)
-                      if one class is much more common.
-
-    Early stopping:
-      Training stops when validation set performance doesn't improve for
-      `early_stopping_rounds` consecutive trees. Prevents overfitting.
-
-    Returns
-    -------
-    xgb.XGBClassifier
-        Trained XGBoost model.
-    """
-    print("  Training XGBoost classifier...")
-
-    # Compute home win rate for class balance check
-    # In R: table(y_train) / length(y_train)
-    win_rate = y_train.mean()
-    print(f"  Home win rate in training data: {win_rate:.3f}")
-
-    # XGBoost hyperparameters
-    # In R: these would go inside the xgboost() or train() call
+def _train_xgb(X_train, y_train, X_val=None, y_val=None) -> xgb.XGBClassifier:
     params = {
-        "n_estimators":     300,
-        "max_depth":        5,
-        "learning_rate":    0.05,    # "eta" in XGBoost terminology
-        "subsample":        0.8,
-        "colsample_bytree": 0.8,
-        "min_child_weight": 5,       # Minimum # of samples in a leaf
-        "reg_alpha":        0.1,     # L1 regularization
-        "reg_lambda":       1.0,     # L2 regularization
-        "objective":        "binary:logistic",  # Output probabilities
+        "n_estimators":     400,
+        "max_depth":        4,
+        "learning_rate":    0.03,
+        "subsample":        0.75,
+        "colsample_bytree": 0.75,
+        "min_child_weight": 10,      # forces larger leaf nodes → reduces overfitting
+        "reg_alpha":        0.5,     # L1: sparsity
+        "reg_lambda":       2.0,     # L2: shrinkage
+        "objective":        "binary:logistic",
         "eval_metric":      "logloss",
         "random_state":     42,
-        "tree_method":      "hist",  # Fast histogram-based training
-        "verbosity":        0,       # Quiet training output
+        "tree_method":      "hist",
+        "verbosity":        0,
     }
-
     model = xgb.XGBClassifier(**params)
 
-    # Train with early stopping: stop if val logloss doesn't improve in 30 rounds
-    model.fit(
-        X_train, y_train,
-        eval_set=[(X_test, y_test)],
-        verbose=False
-    )
+    if X_val is not None and y_val is not None:
+        model.fit(X_train, y_train,
+                  eval_set=[(X_val, y_val)],
+                  verbose=False)
+    else:
+        model.fit(X_train, y_train, verbose=False)
 
-    print(f"  ✓ Model trained.")
     return model
 
 
 # =============================================================================
-# FUNCTION 4: Evaluate Model Performance
+# TRAIN FINAL MODEL WITH CALIBRATION
 # =============================================================================
-def evaluate_model(model: xgb.XGBClassifier,
-                   X_test: pd.DataFrame, y_test: pd.Series) -> dict:
+def train_final_model(X: pd.DataFrame, y: pd.Series,
+                      df: pd.DataFrame) -> tuple:
     """
-    Compute comprehensive evaluation metrics for the trained model.
+    Train the production model on all available seasons.
 
-    Metrics for a binary probability model:
-      Log Loss: lower = better probability calibration
-        - A coin flip model = log_loss of ~0.693
-        - A good sports model might achieve 0.670 (marginal edge over random)
-        - The betting market is very efficient; 0.680–0.685 is realistic
+    Calibration strategy:
+      Reserve 15% of the most-recent-season data as a calibration holdout.
+      Train XGBoost on the remaining 85%.
+      Wrap with CalibratedClassifierCV (isotonic) on the holdout.
+      This produces well-calibrated probabilities rather than raw logit scores.
 
-      Brier Score: mean squared error of probabilities
-        - 0.25 = random (predicting 0.5 always)
-        - A good model: 0.23–0.245
-
-      AUC-ROC: area under the ROC curve
-        - 0.5 = random; 1.0 = perfect; realistic: 0.52–0.56 for moneyline
-
-      Accuracy: % of games predicted correctly
-        - Baseline: 54% (home win rate) — must beat this
-        - A good model: 55–57%
-
-    Returns
-    -------
-    dict
-        All computed metrics.
+    Returns: (calibrated_model, uncalibrated_xgb_model)
     """
-    # Predict probabilities (like predict(model, newdata, type="response") in R)
-    y_prob = model.predict_proba(X_test)[:, 1]  # Column 1 = P(home wins)
-    y_pred = (y_prob >= 0.5).astype(int)         # Convert to binary predictions
+    seasons = sorted(df["season"].unique())
+    last_season = seasons[-1]
 
-    metrics = {
-        "log_loss":    log_loss(y_test, y_prob),
-        "brier_score": brier_score_loss(y_test, y_prob),
-        "roc_auc":     roc_auc_score(y_test, y_prob),
-        "accuracy":    accuracy_score(y_test, y_pred),
-        "n_test":      len(y_test),
-    }
+    # Calibration holdout: 15% of the most recent season, randomly
+    last_season_mask = df["season"] == last_season
+    X_last = X[last_season_mask]
+    y_last = y[last_season_mask]
 
-    print("\n  ── Model Evaluation (Test Season) ──────────────────────────")
-    print(f"  Log Loss  : {metrics['log_loss']:.4f}  (lower = better; random ≈ 0.693)")
-    print(f"  Brier     : {metrics['brier_score']:.4f}  (lower = better; random ≈ 0.250)")
-    print(f"  AUC-ROC   : {metrics['roc_auc']:.4f}  (higher = better; random = 0.500)")
-    print(f"  Accuracy  : {metrics['accuracy']:.4f}  (baseline ≈ home win rate)")
-    print(f"  N Test    : {metrics['n_test']:,} games")
-    print("  ─────────────────────────────────────────────────────────────")
+    X_cal_holdout, X_full_last, y_cal_holdout, y_full_last = train_test_split(
+        X_last, y_last, test_size=0.85, random_state=42, stratify=y_last
+    )
 
-    return metrics
+    # Combine non-holdout last-season rows with all earlier seasons
+    X_train_base = pd.concat([X[~last_season_mask], X_full_last])
+    y_train_base = pd.concat([y[~last_season_mask], y_full_last])
+
+    print(f"\n  Training base XGBoost on {len(X_train_base):,} games...")
+    base_model = _train_xgb(X_train_base, y_train_base)
+
+    # Isotonic calibration on the holdout set
+    print(f"  Calibrating probabilities on {len(X_cal_holdout):,}-game holdout...")
+    cal_model = CalibratedClassifierCV(base_model, cv="prefit", method="isotonic")
+    cal_model.fit(X_cal_holdout, y_cal_holdout)
+    print("  ✓ Calibration complete.")
+
+    return cal_model, base_model
 
 
 # =============================================================================
-# FUNCTION 5: Feature Importance Analysis
+# FEATURE IMPORTANCE
 # =============================================================================
-def analyze_feature_importance(model: xgb.XGBClassifier,
-                                feature_cols: list) -> pd.DataFrame:
-    """
-    Compute and display XGBoost feature importances.
-
-    XGBoost provides multiple importance types:
-      - 'weight'  : How many times a feature is used in splits
-      - 'gain'    : Average improvement in accuracy per split using this feature
-                    (most useful for understanding which features actually HELP)
-      - 'cover'   : Average number of samples affected by splits using this feature
-
-    'gain' is typically the most interpretable — it measures how much each
-    feature actually improves predictions when used for a decision.
-
-    R equivalent: xgb.importance(model=model); xgb.plot.importance(importance)
-    """
-    # Get feature importances (using gain metric)
-    # In R: importance_matrix <- xgb.importance(model=model)
-    importances = model.feature_importances_  # This is the 'gain' metric by default
-
-    importance_df = pd.DataFrame({
+def feature_importance_report(base_model: xgb.XGBClassifier,
+                               feature_cols: list) -> pd.DataFrame:
+    imp = pd.DataFrame({
         "feature":    feature_cols,
-        "importance": importances,
+        "importance": base_model.feature_importances_,
     }).sort_values("importance", ascending=False)
 
-    print("\n  ── Feature Importances (Top 10) ─────────────────────────────")
-    for _, row in importance_df.head(10).iterrows():
-        bar = "█" * int(row["importance"] * 200)
-        print(f"  {row['feature']:35s} | {row['importance']:.4f} | {bar}")
-    print("  ─────────────────────────────────────────────────────────────")
+    print("\n  ── Top 15 Feature Importances ─────────────────────────────────")
+    for _, row in imp.head(15).iterrows():
+        bar = "█" * max(1, int(row["importance"] * 300))
+        print(f"  {row['feature']:40s} | {row['importance']:.4f} | {bar}")
+    print("  ────────────────────────────────────────────────────────────────")
 
-    return importance_df
-
-
-# =============================================================================
-# FUNCTION 6: Score Upcoming Games
-# =============================================================================
-def score_todays_games(model: xgb.XGBClassifier, feature_cols: list,
-                       matchup_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Apply the trained model to today's upcoming games.
-
-    Inputs
-    ------
-    model       : Trained XGBoost model (loaded from models/ directory)
-    feature_cols: List of column names the model was trained on
-    matchup_df  : DataFrame with today's matchups (one row per game)
-
-    The matchup_df must have the same feature columns as the training data.
-    You'll construct this from:
-      - Confirmed starting lineups (from RotoWire or MLB.com)
-      - Confirmed starting pitchers (from MLB.com Probable Pitchers)
-      - Their current-season stats (from pybaseball or manual lookup)
-
-    Returns
-    -------
-    pd.DataFrame
-        matchup_df with added columns:
-          - p_home_win : Model's probability that home team wins (0.0–1.0)
-          - p_away_win : Model's probability that away team wins (0.0–1.0)
-    """
-    # Ensure all required feature columns are present
-    missing_cols = [c for c in feature_cols if c not in matchup_df.columns]
-    if missing_cols:
-        print(f"  WARNING: Missing feature columns: {missing_cols}")
-        print(f"  Filling with training data means.")
-        # Load training data to get column means for imputation
-        train_path = os.path.join(PROC_DIR, "moneyline_dataset.csv")
-        if os.path.exists(train_path):
-            train_df   = pd.read_csv(train_path)
-            col_means  = train_df[feature_cols].mean()
-            for col in missing_cols:
-                matchup_df[col] = col_means.get(col, 0.0)
-
-    # Make predictions
-    X_score = matchup_df[feature_cols].copy()
-
-    # Predict probabilities for each game
-    # model.predict_proba() returns array with shape (n_games, 2)
-    # Column 0 = P(away wins), Column 1 = P(home wins)
-    probs = model.predict_proba(X_score)
-
-    matchup_df["p_home_win"] = probs[:, 1].round(4)
-    matchup_df["p_away_win"] = probs[:, 0].round(4)
-
-    return matchup_df
+    return imp
 
 
 # =============================================================================
-# FUNCTION 7: Build Example Scoring Template
+# SCORE TEMPLATE BUILDER
 # =============================================================================
-def build_scoring_template(feature_cols: list, train_df: pd.DataFrame) -> pd.DataFrame:
+def build_scoring_template(feature_cols: list, df: pd.DataFrame) -> pd.DataFrame:
     """
-    Create a scoring template DataFrame for today's games.
+    Generate a placeholder scoring template for today's games.
 
-    In production, you would populate this template with:
-      1. Pull today's probable starters from MLB.com
-      2. Look up their current season SIERA, xFIP, K%, BB% from FanGraphs
-      3. Look up each team's current wRC+, wOBA from team_batting()
-      4. Fill in park factor from the PARK_FACTORS dictionary
-
-    This template uses MEAN values from training data as placeholders.
-    Replace these with actual current-season stats for real predictions.
-
-    Returns
-    -------
-    pd.DataFrame
-        Template with 3 example games (modify for actual matchups).
+    In production (run_daily.py / 04_export_moneyline.py), this template
+    is replaced with live values:
+      - home/away SP MLBAM ID → looked up in Statcast expected/arsenal
+      - home/away team → looked up in platoon splits + bullpen lookup
     """
-    print("  Building scoring template for today's games...")
-
-    # Get column means from training data as sensible defaults
-    col_means = train_df[feature_cols].mean().to_dict()
-
-    # Create example matchups — replace with actual games
-    # In R: data.frame(home_team="NYY", away_team="BOS", ...)
+    col_means = df[feature_cols].mean().to_dict()
     example_games = [
-        {
-            "game_date": "2025-04-01",
-            "home_team": "NYY",
-            "away_team": "BOS",
-            **col_means  # All features set to training average as placeholder
-        },
-        {
-            "game_date": "2025-04-01",
-            "home_team": "LAD",
-            "away_team": "SFG",
-            **col_means
-        },
-        {
-            "game_date": "2025-04-01",
-            "home_team": "HOU",
-            "away_team": "TEX",
-            **col_means
-        },
+        {"game_date": "2026-04-01", "home_team": "NYY", "away_team": "BOS", **col_means},
+        {"game_date": "2026-04-01", "home_team": "LAD", "away_team": "SFG", **col_means},
+        {"game_date": "2026-04-01", "home_team": "HOU", "away_team": "TEX", **col_means},
     ]
-
-    template = pd.DataFrame(example_games)
-    print(f"  ✓ Template created with {len(template)} example games.")
-    print("  NOTE: Replace feature values with actual current-season stats.")
-    return template
+    return pd.DataFrame(example_games)
 
 
 # =============================================================================
-# MAIN EXECUTION
+# MAIN
 # =============================================================================
 if __name__ == "__main__":
     print("=" * 70)
-    print("MONEYLINE MODEL — STEP 3: MODEL TRAINING AND SCORING")
+    print("MONEYLINE MODEL — STEP 3: MODEL TRAINING (REFACTORED)")
     print("=" * 70)
 
     data_path = os.path.join(PROC_DIR, "moneyline_dataset.csv")
-
     if not os.path.exists(data_path):
-        print(f"ERROR: {data_path} not found. Run 02_build_moneyline.py first.")
+        print(f"ERROR: {data_path} not found.  Run 02_build_moneyline.py first.")
         exit(1)
 
-    # Load data
-    print("\n[ 1/6 ] Loading training data...")
+    # Load
+    print("\n[ 1/5 ] Loading dataset...")
     X, y, df, feature_cols = load_data(data_path)
+    print(f"  Feature count: {len(feature_cols)}")
+    print(f"  Features: {feature_cols}")
 
-    # Time-based split
-    print("\n[ 2/6 ] Splitting train/test by season...")
-    X_train, X_test, y_train, y_test = time_split(df, X, y, test_season=2025)
+    # Walk-forward CV
+    print("\n[ 2/5 ] Walk-forward cross-validation...")
+    cv_results = walk_forward_cv(df, X, y, feature_cols)
 
-    # Train model
-    print("\n[ 3/6 ] Training XGBoost model...")
-    model = train_xgboost(X_train, y_train, X_test, y_test)
+    if cv_results:
+        avg_auc = np.mean([m["auc"]      for m in cv_results])
+        avg_ll  = np.mean([m["log_loss"] for m in cv_results])
+        avg_br  = np.mean([m["brier"]    for m in cv_results])
+        avg_acc = np.mean([m["accuracy"] for m in cv_results])
+        print(f"\n  ── Walk-Forward CV Summary ({'–'.join(str(m['fold']) for m in cv_results)}) ──")
+        print(f"  Avg AUC-ROC  : {avg_auc:.4f}")
+        print(f"  Avg Log Loss : {avg_ll:.4f}")
+        print(f"  Avg Brier    : {avg_br:.4f}")
+        print(f"  Avg Accuracy : {avg_acc:.4f}")
 
-    # Evaluate
-    print("\n[ 4/6 ] Evaluating model...")
-    metrics = evaluate_model(model, X_test, y_test)
+    # Train final model with calibration
+    print("\n[ 3/5 ] Training final calibrated model (all seasons)...")
+    cal_model, base_model = train_final_model(X, y, df)
 
-    # Feature importance
-    print("\n[ 5/6 ] Analyzing feature importances...")
-    importance_df = analyze_feature_importance(model, feature_cols)
+    # Evaluate calibrated model on last season
+    print("\n[ 4/5 ] Evaluating calibrated model on most recent season...")
+    last_season = sorted(df["season"].unique())[-1]
+    test_mask   = df["season"] == last_season
+    X_test = X[test_mask]
+    y_test = y[test_mask]
 
-    # Save model and feature info for use in export step
-    print("\n[ 6/6 ] Saving model and generating scoring template...")
+    y_prob_cal = cal_model.predict_proba(X_test)[:, 1]
+    y_pred_cal = (y_prob_cal >= 0.5).astype(int)
+    final_metrics = {
+        "calibrated_auc":      round(roc_auc_score(y_test, y_prob_cal), 4),
+        "calibrated_log_loss": round(log_loss(y_test, y_prob_cal), 4),
+        "calibrated_brier":    round(brier_score_loss(y_test, y_prob_cal), 4),
+        "calibrated_accuracy": round(accuracy_score(y_test, y_pred_cal), 4),
+        "n_test":              int(len(y_test)),
+        "test_season":         int(last_season),
+        "n_features":          len(feature_cols),
+        "cv_folds":            cv_results,
+    }
+    print(f"\n  Calibrated model — test season {last_season}:")
+    print(f"    AUC-ROC  : {final_metrics['calibrated_auc']:.4f}")
+    print(f"    Log Loss : {final_metrics['calibrated_log_loss']:.4f}")
+    print(f"    Brier    : {final_metrics['calibrated_brier']:.4f}")
+    print(f"    Accuracy : {final_metrics['calibrated_accuracy']:.4f}")
+
+    # Feature importance (from uncalibrated base model)
+    print("\n[ 5/5 ] Feature importances + saving artifacts...")
+    imp_df = feature_importance_report(base_model, feature_cols)
+
+    # ── Save artifacts ──────────────────────────────────────────────────────
+    # XGBoost base model (native format for fast loading)
     model_path = os.path.join(MODEL_DIR, "moneyline_model.json")
-    model.save_model(model_path)
-    print(f"  ✓ Model saved: {model_path}")
+    base_model.save_model(model_path)
+    print(f"  ✓ Base XGBoost model   : {model_path}")
 
-    # Save feature column list (critical — must match between train and score)
-    feature_path = os.path.join(MODEL_DIR, "moneyline_features.json")
-    with open(feature_path, "w") as f:
+    # Calibrated model (sklearn format via joblib)
+    import joblib
+    cal_path = os.path.join(MODEL_DIR, "moneyline_calibrated.pkl")
+    joblib.dump(cal_model, cal_path)
+    print(f"  ✓ Calibrated model     : {cal_path}")
+
+    # Feature list (must match between train and score)
+    feat_path = os.path.join(MODEL_DIR, "moneyline_features.json")
+    with open(feat_path, "w") as f:
         json.dump(feature_cols, f)
-    print(f"  ✓ Features saved: {feature_path}")
+    print(f"  ✓ Feature list         : {feat_path}")
 
-    # Save metrics
-    metrics_path = os.path.join(MODEL_DIR, "moneyline_metrics.json")
-    with open(metrics_path, "w") as f:
-        json.dump(metrics, f, indent=2)
-    print(f"  ✓ Metrics saved: {metrics_path}")
+    # Metrics
+    met_path = os.path.join(MODEL_DIR, "moneyline_metrics.json")
+    with open(met_path, "w") as f:
+        json.dump(final_metrics, f, indent=2)
+    print(f"  ✓ Metrics              : {met_path}")
 
-    # Save importance
-    importance_df.to_csv(os.path.join(MODEL_DIR, "moneyline_feature_importance.csv"), index=False)
+    # Feature importance CSV
+    imp_path = os.path.join(MODEL_DIR, "moneyline_feature_importance.csv")
+    imp_df.to_csv(imp_path, index=False)
+    print(f"  ✓ Feature importances  : {imp_path}")
 
-    # Generate scoring template for today's games
+    # Scoring template (placeholder for production export)
     template = build_scoring_template(feature_cols, df)
-    template_path = os.path.join(PROC_DIR, "moneyline_today_template.csv")
-    template.to_csv(template_path, index=False)
-    print(f"  ✓ Scoring template saved: {template_path}")
-
-    # Score the template (example predictions)
-    scored = score_todays_games(model, feature_cols, template)
-    predictions_path = os.path.join(PROC_DIR, "moneyline_predictions.csv")
-    scored.to_csv(predictions_path, index=False)
-    print(f"  ✓ Example predictions saved: {predictions_path}")
-    print(f"\n  Sample predictions:")
-    print(scored[["home_team", "away_team", "p_home_win", "p_away_win"]].to_string(index=False))
+    tmpl_path = os.path.join(PROC_DIR, "moneyline_today_template.csv")
+    template.to_csv(tmpl_path, index=False)
+    print(f"  ✓ Scoring template     : {tmpl_path}")
 
     print("\n" + "=" * 70)
-    print("STEP 3 COMPLETE — Run 04_export_moneyline.py next.")
+    print("STEP 3 COMPLETE — Run 04_export_moneyline.py for today's picks.")
     print("=" * 70)

@@ -1,491 +1,591 @@
 """
 =============================================================================
-HITTER TOTAL BASES MODEL — FILE 2 OF 4: DATASET CONSTRUCTION
+HITTER TOTAL BASES MODEL — FILE 2 OF 4: FEATURE ENGINEERING  (REFACTORED)
 =============================================================================
-Purpose : Build the player-season feature matrix for hitter total bases.
-Input   : CSV files from ../data/raw/
-Output  : ../data/processed/hitter_tb_dataset.csv
+Purpose : Build a player-game-level dataset where each row is one batter
+          appearing in one game, and the target is the DISCRETE total-bases
+          outcome: exactly 0, 1, 2, 3, or 4+ total bases.
 
-What we're building:
-  - Each ROW = one batter-season (aggregated to get per-game rates)
-  - FEATURES = Statcast quality of contact (Barrel%, EV, HardHit%),
-               traditional production (ISO, wOBA), plate discipline (BB%, K%),
-               matchup context (SP handedness, SP K%, platoon advantage)
-  - TARGET = tb_per_game (average total bases per game for that player-season)
+Key changes from prior version:
+  - Target is tb_class ∈ {0, 1, 2, 3, 4} — multinomial, not continuous.
+  - All ID joins use MLBAM numeric keys (via Chadwick register).
+    The old name-matching merge that produced "0 hitters matched" is gone.
+  - Lineup position (batting slot 1–9) is pulled from retrosheet game logs
+    and used to compute expected PA volume (pa_proj) per game.
+  - Batter features: xBA, xSLG, xwOBA, exit_velocity_avg, barrel_batted_rate,
+    launch_angle_avg, hard_hit_percent — taken from PRIOR year to avoid
+    look-ahead bias.
+  - Matchup features: SP handedness, SP pitch arsenal (fastball velo/spin/break,
+    offspeed whiff%), SP xwOBA-against, barrel%-against.
+  - Platoon-adjusted batter wRC+/wOBA/K%/ISO vs SP handedness.
 
-Daily scoring mode:
-  - For prop bets, we predict individual player TB in a specific game.
-  - We use the season-level averages + today's SP matchup as features.
-  - The model outputs E[TB] which we compare to the market prop line.
+Output row schema (one row per batter-game):
+  game_date, season, team, batter_mlbam, batting_slot,
+  pa_proj,            # projected PA in a 9-inning game for this slot
+  -- batter features (prior-year Statcast + FG splits) --
+  xba, xslg, xwoba, ev_avg, barrel_pct, la_avg, hard_hit_pct,
+  wrc_plus_vs_hand, woba_vs_hand, k_pct_vs_hand, iso_vs_hand,
+  -- SP features (prior-year) --
+  sp_mlbam, sp_hand, sp_xwoba_against, sp_barrel_pct, sp_hard_hit_pct,
+  sp_fb_velo, sp_fb_spin, sp_fb_h_break, sp_fb_v_break, sp_fb_whiff_pct,
+  sp_fb_usage, sp_os_whiff_pct, sp_os_usage,
+  -- matchup interactions --
+  ev_vs_sp_xwoba,     # batter ev_avg * sp_xwoba_against (contact quality)
+  barrel_vs_sp_barrel, # batter barrel_pct - sp_barrel_pct_against
+  -- target --
+  tb_actual           # int 0/1/2/3/4 (4 = 4+ TB)
 
-Key insight: "launch angle tightness" (SD of launch angle) matters.
-  - A player with avg LA of 15° could achieve this via many grounders + flyouts.
-  - A player who consistently hits at 15° is a much better TB bet.
-  - We approximate this using sweet spot% (proxy for LA consistency).
-
-For R users:
-  - `pd.merge(..., how='left')` = merge(x, y, all.x=TRUE) in R
-  - Lambda functions `lambda x: x*2` = anonymous functions function(x) x*2 in R
-  - `df.apply(func, axis=1)` = apply(df, 1, func) in R (row-wise)
+Input  : data/raw/raw_*.csv files from 01_input_hitter_tb.py
+Output : data/processed/hitter_tb_dataset.csv
 =============================================================================
 """
 
 import os
-import pandas as pd
+import warnings
 import numpy as np
+import pandas as pd
 
-# --- Configuration ----------------------------------------------------------
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-RAW_DIR  = os.path.join(BASE_DIR, "data", "raw")
-PROC_DIR = os.path.join(BASE_DIR, "data", "processed")
+warnings.filterwarnings("ignore")
 
-# FanGraphs → Baseball Reference team abbreviation mapping
-FG_TO_BREF = {
-    "ARI": "ARI", "ATL": "ATL", "BAL": "BAL", "BOS": "BOS",
-    "CHC": "CHC", "CWS": "CWS", "CIN": "CIN", "CLE": "CLE",
-    "COL": "COL", "DET": "DET", "HOU": "HOU", "KCR": "KCR",
-    "LAA": "LAA", "LAD": "LAD", "MIA": "MIA", "MIL": "MIL",
-    "MIN": "MIN", "NYM": "NYM", "NYY": "NYY", "OAK": "OAK",
-    "PHI": "PHI", "PIT": "PIT", "SDP": "SDP", "SEA": "SEA",
-    "SFG": "SFG", "STL": "STL", "TBR": "TBR", "TEX": "TEX",
-    "TOR": "TOR", "WSN": "WSN", "CHW": "CWS", "SD": "SDP",
-    "SF": "SFG", "TB": "TBR", "KC": "KCR", "WAS": "WSN",
+BASE_DIR  = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+RAW_DIR   = os.path.join(BASE_DIR, "data", "raw")
+PROC_DIR  = os.path.join(BASE_DIR, "data", "processed")
+os.makedirs(PROC_DIR, exist_ok=True)
+
+GAME_YEARS = [2023, 2024, 2025]
+
+# Expected PA per batting slot in a 9-inning game (league averages)
+# Slots 1-3 see ~4.3 PA; slot 9 sees ~3.9 PA
+SLOT_PA_PROJ = {
+    1: 4.33, 2: 4.27, 3: 4.22, 4: 4.17,
+    5: 4.10, 6: 4.05, 7: 4.00, 8: 3.95, 9: 3.90,
 }
 
-# Park factors for HR/TB context
-PARK_HR_FACTOR = {
-    "ARI": 101, "ATL": 104, "BAL": 110, "BOS": 95,  "CHC": 104,
-    "CWS": 99,  "CIN": 106, "CLE": 96,  "COL": 116, "DET": 93,
-    "HOU": 94,  "KCR": 97,  "LAA": 99,  "LAD": 91,  "MIA": 95,
-    "MIL": 100, "MIN": 107, "NYM": 97,  "NYY": 114, "OAK": 96,
-    "PHI": 106, "PIT": 97,  "SDP": 91,  "SEA": 89,  "SFG": 86,
-    "STL": 101, "TBR": 98,  "TEX": 104, "TOR": 109, "WSN": 104,
-}
+FASTBALL_TYPES = {"FF", "SI", "FT", "FC"}
+OFFSPEED_TYPES = {"SL", "CU", "CH", "KC", "FS", "EP", "KN", "SC"}
 
-# Exit velocity expected outcomes table (from document)
-# Maps avg EV band → expected SLG (used for cross-validation context)
-EV_TO_EXPECTED_SLG = {
-    115: 1.800, 110: 1.600, 105: 1.300, 100: 0.750, 95: 0.450
+# Retrosheet team-code → standard abbreviation (same map used in moneyline model)
+RETRO_TO_STD = {
+    "ANA": "LAA", "ARI": "ARI", "ATL": "ATL", "BAL": "BAL", "BOS": "BOS",
+    "CHA": "CWS", "CHN": "CHC", "CIN": "CIN", "CLE": "CLE", "COL": "COL",
+    "DET": "DET", "HOU": "HOU", "KCA": "KC",  "LAN": "LAD", "MIA": "MIA",
+    "MIL": "MIL", "MIN": "MIN", "NYA": "NYY", "NYN": "NYM", "OAK": "OAK",
+    "PHI": "PHI", "PIT": "PIT", "SDN": "SD",  "SEA": "SEA", "SFN": "SF",
+    "SLN": "STL", "TBA": "TB",  "TEX": "TEX", "TOR": "TOR", "WAS": "WSH",
+    "FLO": "MIA",
 }
 
 
 # =============================================================================
-# FUNCTION 1: Load and Align All Raw Files
+# LOAD RAW DATA
 # =============================================================================
-def load_raw_data() -> dict:
-    """
-    Load all raw data files from the data/raw directory.
-
-    Player ID alignment is a key challenge — FanGraphs and Statcast use
-    different player IDs. We align on Name + Season as a fallback.
-    """
+def load_raw() -> dict:
     print("  Loading raw data files...")
-    data = {}
-    files = {
-        "ev_barrels":    "raw_hitter_ev_barrels.csv",
-        "xstats":        "raw_hitter_xstats.csv",
-        "batting":       "raw_hitter_batting.csv",
-        "pitcher_xstats": "raw_pitcher_xstats.csv",
-        "fg_pitcher":    "raw_fg_pitcher_stats.csv",
-        "arsenal":       "raw_pitcher_arsenal.csv",
-    }
-    for key, fname in files.items():
-        path = os.path.join(RAW_DIR, fname)
+    raw = {}
+
+    def _load(name, file_key):
+        path = os.path.join(RAW_DIR, f"raw_{file_key}.csv")
+        if not os.path.exists(path):
+            print(f"    WARNING: {path} not found — skipping")
+            return pd.DataFrame()
+        df = pd.read_csv(path, low_memory=False)
+        print(f"    {name}: {len(df):,} rows")
+        return df
+
+    raw["chad"]          = _load("Chadwick register",     "chadwick")
+    raw["bat_exp"]       = _load("Batter expected stats", "batter_expected")
+    raw["bat_ev"]        = _load("Batter EV/barrel",      "batter_ev_barrels")
+    raw["splits_lhp"]    = _load("Batting splits vs LHP", "batting_splits_lhp")
+    raw["splits_rhp"]    = _load("Batting splits vs RHP", "batting_splits_rhp")
+    raw["pit_arsenal"]   = _load("Pitcher arsenal",       "pitcher_arsenal")
+    raw["pit_exp"]       = _load("Pitcher expected",      "pitcher_expected")
+
+    frames = []
+    for yr in GAME_YEARS:
+        path = os.path.join(RAW_DIR, f"raw_retrosheet_{yr}.csv")
         if os.path.exists(path):
-            data[key] = pd.read_csv(path)
-            print(f"    ✓ {fname}: {len(data[key]):,} rows")
-        else:
-            print(f"    ✗ {fname}: NOT FOUND")
-            data[key] = pd.DataFrame()
-    return data
+            frames.append(pd.read_csv(path, low_memory=False))
+    raw["retro"] = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    print(f"    Retrosheet logs: {len(raw['retro']):,} games")
+
+    return raw
 
 
 # =============================================================================
-# FUNCTION 2: Build Batter-Season Feature Table
+# BUILD ID MAP  (retrosheet retro_id → MLBAM, MLBAM → FGid)
 # =============================================================================
-def build_batter_features(data: dict) -> pd.DataFrame:
+def build_id_map(chad: pd.DataFrame) -> tuple:
     """
-    Merge FanGraphs batting stats with Statcast EV/barrel and expected stats.
-
-    The merge strategy:
-      1. Start with FanGraphs batting stats (wide coverage, many metrics)
-      2. Left-join Statcast EV/barrel data on player_id + Season
-      3. Left-join Statcast expected stats on player_id + Season
-      4. Compute derived features (TB per game, platoon indicator, etc.)
-
-    Player ID alignment:
-      - FanGraphs uses 'IDfg' (numeric)
-      - Statcast uses 'player_id' (numeric, same as MLB MLBAM ID)
-      - These are DIFFERENT ID systems. We use playerid_lookup() to map them,
-        or fall back to name matching. The build file uses name matching
-        as a pragmatic approach.
-
-    Returns
-    -------
-    pd.DataFrame
-        One row per batter-season with all features and TB target.
+    Returns:
+      retro_to_mlbam: {retro_id_str: mlbam_int}
+      mlbam_to_fg:    {mlbam_int: fgid_int}
     """
-    print("  Building batter features...")
+    if chad.empty:
+        return {}, {}
 
-    batting = data["batting"].copy()
-    if batting.empty:
-        print("    ERROR: batting data is empty. Cannot build batter features.")
-        return pd.DataFrame()
+    retro_to_mlbam = {}
+    if "key_retro" in chad.columns:
+        sub = chad.dropna(subset=["key_retro", "key_mlbam"])
+        retro_to_mlbam = dict(zip(sub["key_retro"].astype(str),
+                                   sub["key_mlbam"].astype(int)))
 
-    # Standardize team
-    if "Team" in batting.columns:
-        batting["team_std"] = batting["Team"].map(FG_TO_BREF).fillna(batting["Team"])
+    mlbam_to_fg = {}
+    sub2 = chad.dropna(subset=["key_mlbam", "key_fangraphs"])
+    mlbam_to_fg = dict(zip(sub2["key_mlbam"].astype(int),
+                            sub2["key_fangraphs"].astype(int)))
 
-    # Ensure we have a clean name for joining
-    if "Name" in batting.columns:
-        # Normalize name format: remove accents etc. for consistent matching
-        batting["name_clean"] = batting["Name"].str.lower().str.strip()
-
-    # Compute or verify total bases and per-game rate
-    if "total_bases" not in batting.columns:
-        if all(c in batting.columns for c in ["H", "2B", "3B", "HR", "G"]):
-            batting["singles"]      = batting["H"] - batting["2B"] - batting["3B"] - batting["HR"]
-            batting["total_bases"]  = (batting["singles"]
-                                       + 2 * batting["2B"]
-                                       + 3 * batting["3B"]
-                                       + 4 * batting["HR"])
-            batting["tb_per_game"]  = batting["total_bases"] / batting["G"].clip(lower=1)
-        else:
-            batting["tb_per_game"]  = np.nan
-
-    # Power metrics: ISO = SLG - AVG (isolated extra-base hit power)
-    if "SLG" in batting.columns and "AVG" in batting.columns:
-        batting["ISO"] = batting["SLG"] - batting["AVG"]
-
-    # HR rate per game (key power indicator)
-    if "HR" in batting.columns and "G" in batting.columns:
-        batting["hr_per_game"]  = batting["HR"] / batting["G"].clip(lower=1)
-        batting["xbh_per_game"] = (batting["2B"] + batting["3B"] + batting["HR"]) \
-                                   / batting["G"].clip(lower=1) if "2B" in batting.columns else np.nan
-
-    # --- Merge Statcast EV/barrel data ---------------------------------------
-    ev_df = data["ev_barrels"].copy()
-    if not ev_df.empty:
-        # Clean up player name column (Statcast format: "last_name, first_name")
-        if "last_name, first_name" in ev_df.columns:
-            ev_df["name_clean"] = (
-                ev_df["last_name, first_name"]
-                .str.lower().str.strip()
-                .str.replace(", ", " ", regex=False)
-            )
-        elif "player_name" in ev_df.columns:
-            ev_df["name_clean"] = ev_df["player_name"].str.lower().str.strip()
-
-        # Try to merge on player_id first, then fall back to name
-        ev_cols = ["Season", "avg_exit_velo", "hard_hit_pct", "barrel_pct",
-                   "barrel_per_pa", "sweet_spot_pct", "avg_launch_angle",
-                   "hard_hit_count", "barrels"]
-        # Also check original column names in case rename wasn't applied
-        ev_cols_raw = ["Season", "avg_hit_speed", "ev95percent", "brl_percent",
-                       "brl_pa", "anglesweetspotpercent", "avg_hit_angle"]
-
-        merge_cols  = [c for c in ev_cols if c in ev_df.columns]
-        merge_cols += [c for c in ev_cols_raw if c in ev_df.columns and c not in merge_cols]
-
-        if "player_id" in ev_df.columns and "IDfg" in batting.columns:
-            # Ideal: merge on numeric ID (most reliable)
-            # But FG IDfg ≠ Savant player_id — need MLBAM ID mapping
-            # Fallback to name merge below
-            pass
-
-        if "name_clean" in ev_df.columns and "name_clean" in batting.columns:
-            ev_subset = ev_df[["name_clean", "Season"] + [c for c in merge_cols
-                                                            if c != "Season"]].copy()
-            batting = batting.merge(ev_subset, on=["name_clean", "Season"], how="left")
-            print(f"    Merged EV/barrel data: {batting['barrel_pct' if 'barrel_pct' in batting.columns else 'brl_percent'].notna().sum()} hitters matched")
-
-    # --- Merge expected stats (xBA, xSLG, xwOBA) ----------------------------
-    xstats = data["xstats"].copy()
-    if not xstats.empty:
-        if "last_name, first_name" in xstats.columns:
-            xstats["name_clean"] = (
-                xstats["last_name, first_name"]
-                .str.lower().str.strip()
-                .str.replace(", ", " ", regex=False)
-            )
-
-        xcols = [c for c in ["est_ba", "est_slg", "est_woba",
-                              "est_woba_minus_woba_diff", "woba",
-                              "est_slg_minus_slg_diff"] if c in xstats.columns]
-        if xcols and "name_clean" in xstats.columns and "name_clean" in batting.columns:
-            xstats_sub = xstats[["name_clean", "Season"] + xcols].copy()
-            batting = batting.merge(xstats_sub, on=["name_clean", "Season"], how="left")
-            print(f"    Merged expected stats: {xstats_sub.shape[0]} rows.")
-
-    # --- Add park factor for home team --------------------------------------
-    if "team_std" in batting.columns:
-        batting["home_park_hr_factor"] = batting["team_std"].map(PARK_HR_FACTOR).fillna(100)
-
-    # --- Create platoon indicator (LHH vs RHP → advantage) -----------------
-    # Most hitters bat better against opposite-hand pitchers.
-    # Without individual handedness data in FG batting_stats, we flag
-    # the matchup at scoring time when SP handedness is known.
-    # For training, we include a placeholder.
-    batting["platoon_advantage"] = 0  # Updated at scoring time
-
-    print(f"    ✓ Batter features: {len(batting):,} batter-season rows.")
-    return batting
+    print(f"    ID map: {len(retro_to_mlbam):,} retro→MLBAM, "
+          f"{len(mlbam_to_fg):,} MLBAM→FG")
+    return retro_to_mlbam, mlbam_to_fg
 
 
 # =============================================================================
-# FUNCTION 3: Build Pitcher Matchup Features
+# BUILD BATTER FEATURE LOOKUP  (keyed by (mlbam, season))
 # =============================================================================
-def build_pitcher_matchup_features(data: dict) -> pd.DataFrame:
+def build_batter_features(bat_exp: pd.DataFrame,
+                           bat_ev: pd.DataFrame) -> dict:
     """
-    Build a pitcher-season lookup for use in daily matchup scoring.
-
-    When scoring today's games, we look up the opposing SP's stats here
-    to create matchup-specific features:
-      - sp_k_pct        : Higher K% = harder for hitter to reach base
-      - sp_xwoba_allowed: Contact quality — low xwOBA = pitcher keeps hitters off base
-      - sp_siera        : Overall quality
-      - sp_swstr_pct    : Swing-and-miss rate — higher = harder to make contact at all
-
-    Returns
-    -------
-    pd.DataFrame
-        One row per pitcher-season for matchup lookups.
+    Merges expected stats and EV/barrel stats on MLBAM key.
+    Returns: batter_lookup[(mlbam, season)] = feature dict
     """
-    print("  Building pitcher matchup features...")
+    EXP_COLS = ["key_mlbam", "season", "est_ba", "est_slg", "est_woba"]
+    EV_COLS  = ["key_mlbam", "season",
+                "exit_velocity_avg", "launch_angle_avg",
+                "barrel_batted_rate", "hard_hit_percent"]
 
-    fg_pit = data["fg_pitcher"].copy()
-    if fg_pit.empty:
-        return pd.DataFrame()
+    def _norm(df, cols):
+        keep = [c for c in cols if c in df.columns]
+        return df[keep].copy()
 
-    if "Team" in fg_pit.columns:
-        fg_pit["team_std"] = fg_pit["Team"].map(FG_TO_BREF).fillna(fg_pit["Team"])
+    exp = _norm(bat_exp, EXP_COLS)
+    ev  = _norm(bat_ev,  EV_COLS)
 
-    # Merge with Statcast pitcher xwOBA allowed
-    pit_xstats = data["pitcher_xstats"].copy()
-    if not pit_xstats.empty:
-        if "last_name, first_name" in pit_xstats.columns:
-            pit_xstats["name_clean"] = (
-                pit_xstats["last_name, first_name"]
-                .str.lower().str.strip()
-                .str.replace(", ", " ", regex=False)
-            )
-        if "Name" in fg_pit.columns:
-            fg_pit["name_clean"] = fg_pit["Name"].str.lower().str.strip()
+    if exp.empty or ev.empty:
+        return {}
 
-        xcols_pit = [c for c in ["est_woba", "est_era", "woba"] if c in pit_xstats.columns]
-        if xcols_pit and "name_clean" in pit_xstats.columns:
-            pit_xstats_sub = pit_xstats[["name_clean", "Season"] + xcols_pit].copy()
-            pit_xstats_sub = pit_xstats_sub.rename(
-                columns={c: f"sp_{c}_allowed" for c in xcols_pit}
-            )
-            fg_pit = fg_pit.merge(pit_xstats_sub, on=["name_clean", "Season"], how="left")
+    merged = pd.merge(exp, ev, on=["key_mlbam", "season"], how="outer")
 
-    # Select key matchup features
-    keep_cols = ["Name", "name_clean", "team_std", "Season", "IDfg",
-                 "GS", "IP", "K%", "BB%", "K-BB%", "SIERA", "xFIP", "FIP",
-                 "SwStr%", "F-Strike%"]
-    # Add Statcast-derived columns
-    keep_cols += [c for c in fg_pit.columns if c.startswith("sp_")]
-    keep_cols  = [c for c in keep_cols if c in fg_pit.columns]
-
-    pitcher_features = fg_pit[keep_cols].copy()
-
-    # Rename for clarity in downstream joins
-    rename_map = {
-        "K%":       "sp_k_pct",
-        "BB%":      "sp_bb_pct",
-        "K-BB%":    "sp_k_minus_bb_pct",
-        "SIERA":    "sp_siera",
-        "xFIP":     "sp_xfip",
-        "FIP":      "sp_fip",
-        "SwStr%":   "sp_swstr_pct",
-        "F-Strike%":"sp_fstrike_pct",
+    rename = {
+        "est_ba":               "xba",
+        "est_slg":              "xslg",
+        "est_woba":             "xwoba",
+        "exit_velocity_avg":    "ev_avg",
+        "launch_angle_avg":     "la_avg",
+        "barrel_batted_rate":   "barrel_pct",
+        "hard_hit_percent":     "hard_hit_pct",
     }
-    rename_map = {k: v for k, v in rename_map.items() if k in pitcher_features.columns}
-    pitcher_features = pitcher_features.rename(columns=rename_map)
+    merged.rename(columns={k: v for k, v in rename.items()
+                            if k in merged.columns}, inplace=True)
 
-    print(f"    ✓ Pitcher matchup features: {len(pitcher_features):,} pitcher-season rows.")
-    return pitcher_features
+    feat_cols = ["xba", "xslg", "xwoba", "ev_avg", "la_avg",
+                 "barrel_pct", "hard_hit_pct"]
+    for col in feat_cols:
+        if col not in merged.columns:
+            merged[col] = np.nan
+
+    batter_lookup = {}
+    for _, row in merged.iterrows():
+        mlbam = int(row["key_mlbam"]) if pd.notna(row.get("key_mlbam")) else None
+        yr    = int(row["season"])    if pd.notna(row.get("season")) else None
+        if mlbam and yr:
+            batter_lookup[(mlbam, yr)] = {c: row.get(c, np.nan) for c in feat_cols}
+
+    print(f"    Batter feature lookup: {len(batter_lookup):,} (mlbam, season) entries")
+    return batter_lookup
 
 
 # =============================================================================
-# FUNCTION 4: Create Matchup-Adjusted Hitter Dataset
+# BUILD PLATOON FEATURE LOOKUP  (keyed by (fgid, season, hand))
 # =============================================================================
-def build_matchup_dataset(batter_df: pd.DataFrame, pitcher_df: pd.DataFrame) -> pd.DataFrame:
+def build_platoon_features(splits_lhp: pd.DataFrame,
+                            splits_rhp: pd.DataFrame) -> dict:
     """
-    Combine batter features with a representative SP matchup.
-
-    For TRAINING, we create synthetic matchup rows by pairing each
-    hitter-season with the average opposing SP quality they faced.
-    (Exact game-level matchup data would require pitch-by-pitch processing.)
-
-    For SCORING, the user provides today's SP and we do a point lookup.
-
-    Training target: tb_per_game (continuous) + over_1_5_tb_rate (binary)
-
-    Returns
-    -------
-    pd.DataFrame
-        Training dataset with hitter features + avg matchup context.
+    Returns: platoon_lookup[(fgid, season, hand)] = feature dict
+      hand ∈ {"L", "R"}  (handedness of the SP the batter faces)
     """
-    print("  Building matchup-adjusted dataset...")
+    SPLIT_COLS = ["IDfg", "season", "wRC+", "wOBA", "K%", "ISO"]
 
-    df = batter_df.copy()
+    def _norm(df, hand):
+        keep = [c for c in SPLIT_COLS if c in df.columns]
+        out  = df[keep].copy()
+        out["hand"] = hand
+        return out
 
-    # For training: use league-average SP quality as the matchup baseline.
-    # Each hitter faced a distribution of SPs — the average is a reasonable
-    # training label. This avoids the complexity of exact game-level matching.
-    if not pitcher_df.empty:
-        # Compute league average SP stats by season
-        sp_avg = pitcher_df.groupby("Season")[
-            [c for c in ["sp_k_pct", "sp_bb_pct", "sp_siera", "sp_xfip", "sp_swstr_pct"]
-             if c in pitcher_df.columns]
-        ].mean().reset_index()
+    lhp = _norm(splits_lhp, "L")
+    rhp = _norm(splits_rhp, "R")
 
-        # Rename to indicate these are "average opponent" features
-        avg_rename = {c: f"opp_avg_{c}" for c in sp_avg.columns if c != "Season"}
-        sp_avg = sp_avg.rename(columns=avg_rename)
+    combined = pd.concat([lhp, rhp], ignore_index=True)
+    if combined.empty:
+        return {}
 
-        # Join season average SP stats to each batter
-        # In R: merge(df, sp_avg, by="Season", all.x=TRUE)
-        df = df.merge(sp_avg, on="Season", how="left")
+    rename = {"wRC+": "wrc_plus", "wOBA": "woba", "K%": "k_pct", "ISO": "iso"}
+    combined.rename(columns={k: v for k, v in rename.items()
+                              if k in combined.columns}, inplace=True)
 
-    # Compute over/under threshold rates for different prop lines
-    # In R: df$over_1_5_tb <- as.integer(df$tb_per_game >= 1.5)
-    if "tb_per_game" in df.columns:
-        df["over_0_5_tb_rate"] = (df["tb_per_game"] >= 0.5).astype(float)
-        df["over_1_5_tb_rate"] = (df["tb_per_game"] >= 1.5).astype(float)
-        df["over_2_5_tb_rate"] = (df["tb_per_game"] >= 2.5).astype(float)
+    if "k_pct" in combined.columns:
+        combined["k_pct"] = (combined["k_pct"].astype(str)
+                             .str.replace("%", "", regex=False)
+                             .pipe(pd.to_numeric, errors="coerce")) / 100.0
 
-    print(f"    ✓ Matchup dataset: {len(df):,} batter-season rows.")
-    return df
+    feat_cols = ["wrc_plus", "woba", "k_pct", "iso"]
+
+    platoon_lookup = {}
+    for _, row in combined.iterrows():
+        fgid = int(row["IDfg"])   if pd.notna(row.get("IDfg")) else None
+        yr   = int(row["season"]) if pd.notna(row.get("season")) else None
+        hand = str(row["hand"])
+        if fgid and yr:
+            platoon_lookup[(fgid, yr, hand)] = {
+                c: row.get(c, np.nan) for c in feat_cols
+            }
+
+    print(f"    Platoon feature lookup: {len(platoon_lookup):,} entries")
+    return platoon_lookup
 
 
 # =============================================================================
-# FUNCTION 5: Finalize Feature Selection
+# BUILD SP FEATURE LOOKUP  (keyed by (mlbam, season))
 # =============================================================================
-def finalize_dataset(df: pd.DataFrame) -> pd.DataFrame:
+def build_sp_features(pit_exp: pd.DataFrame,
+                       pit_arsenal: pd.DataFrame) -> dict:
     """
-    Select and clean the final feature set for XGBoost training.
-
-    XGBoost benefits from:
-      - Numeric features (no need for one-hot encoding, handles NaN internally)
-      - Removing redundant correlated features
-      - Sensible missing value handling
-
-    Returns
-    -------
-    pd.DataFrame
-        Clean dataset with selected features and targets.
+    Returns: sp_lookup[(mlbam, season)] = feature dict
     """
-    print("  Finalizing hitter TB dataset...")
+    EXP_COLS = ["key_mlbam", "season", "est_woba", "barrel_percent",
+                "hard_hit_percent", "p_throws"]
+    exp = pit_exp[[c for c in EXP_COLS if c in pit_exp.columns]].copy()
+    exp.rename(columns={
+        "est_woba":         "sp_xwoba_against",
+        "barrel_percent":   "sp_barrel_pct",
+        "hard_hit_percent": "sp_hard_hit_pct",
+        "p_throws":         "sp_hand",
+    }, inplace=True)
 
-    # Define feature groups for readability
-    quality_of_contact = [
-        "barrel_pct", "brl_percent",      # Barrel% (two possible column names)
-        "hard_hit_pct", "ev95percent",     # Hard-Hit% (95+ mph)
-        "avg_exit_velo", "avg_hit_speed",  # Average exit velocity
-        "sweet_spot_pct",                  # Launch angle in sweet spot (8–32°)
-        "avg_launch_angle", "avg_hit_angle",
-    ]
+    sp_lookup = {}
 
-    expected_stats = [
-        "est_ba", "est_slg", "est_woba",   # xBA, xSLG, xwOBA
-        "est_woba_minus_woba_diff",         # Luck indicator (positive = due for uptick)
-        "est_slg_minus_slg_diff",
-    ]
+    if not pit_arsenal.empty:
+        ars = pit_arsenal.copy()
+        if "pitch_type" not in ars.columns:
+            ars["pitch_type"] = "FF"
 
-    traditional_power = [
-        "ISO", "SLG", "wOBA", "wRC+",      # Power and overall production
-        "hr_per_game", "xbh_per_game",
-        "BB%", "K%",                        # Plate discipline
-        "BABIP",                            # Luck on balls in play
-    ]
+        usage_col = next(
+            (c for c in ["pitch_percent", "pitch_usage"] if c in ars.columns),
+            None
+        )
+        count_col = next(
+            (c for c in ["pitches", "n_pitches", "pitch_count"] if c in ars.columns),
+            None
+        )
+        sort_col = count_col or usage_col
 
-    context = [
-        "home_park_hr_factor",             # Park boosts/suppresses TB
-        "platoon_advantage",               # LHH vs RHP advantage (set at scoring time)
-    ]
+        for (mlbam, yr), grp in ars.groupby(["key_mlbam", "season"]):
+            fb  = grp[grp["pitch_type"].isin(FASTBALL_TYPES)]
+            os_ = grp[grp["pitch_type"].isin(OFFSPEED_TYPES)]
 
-    sp_matchup = [
-        "opp_avg_sp_k_pct", "opp_avg_sp_siera", "opp_avg_sp_xfip",
-        "opp_avg_sp_swstr_pct", "opp_avg_sp_bb_pct",
-    ]
+            # Primary fastball = highest-count FB type
+            if not fb.empty and sort_col and sort_col in fb.columns:
+                primary_fb = fb.sort_values(sort_col, ascending=False).iloc[0]
+            elif not fb.empty:
+                primary_fb = fb.iloc[0]
+            else:
+                primary_fb = pd.Series(dtype=float)
 
-    # Combine all feature groups
-    all_features = quality_of_contact + expected_stats + traditional_power + context + sp_matchup
+            # PA-weighted offspeed whiff %
+            if (not os_.empty and usage_col and usage_col in os_.columns
+                    and "whiff_percent" in os_.columns):
+                os_ = os_.copy()
+                os_[usage_col]       = pd.to_numeric(os_[usage_col],       errors="coerce")
+                os_["whiff_percent"] = pd.to_numeric(os_["whiff_percent"],  errors="coerce")
+                total_use = os_[usage_col].sum()
+                os_whiff = (
+                    (os_[usage_col] * os_["whiff_percent"]).sum() / total_use
+                    if total_use > 0 else np.nan
+                )
+                os_total_use = total_use
+            else:
+                os_whiff, os_total_use = np.nan, np.nan
 
-    # Filter to columns that actually exist (API responses vary)
-    all_features = [c for c in all_features if c in df.columns]
+            sp_lookup[(int(mlbam), int(yr))] = {
+                "sp_fb_velo":      float(primary_fb.get("avg_speed",     np.nan)),
+                "sp_fb_spin":      float(primary_fb.get("avg_spin",      np.nan)),
+                "sp_fb_h_break":   float(primary_fb.get("pfx_x",         np.nan)),
+                "sp_fb_v_break":   float(primary_fb.get("pfx_z",         np.nan)),
+                "sp_fb_whiff_pct": float(primary_fb.get("whiff_percent",  np.nan)),
+                "sp_fb_usage":     float(primary_fb.get(usage_col, np.nan)
+                                         if usage_col else np.nan),
+                "sp_os_whiff_pct": float(os_whiff),
+                "sp_os_usage":     float(os_total_use),
+            }
 
-    # Remove duplicates (can happen if both original and renamed columns exist)
-    # In Python, dict.fromkeys preserves order while removing dupes (like unique() in R)
-    all_features = list(dict.fromkeys(all_features))
+    # Overlay expected stats
+    for _, row in exp.iterrows():
+        mlbam = int(row["key_mlbam"]) if pd.notna(row.get("key_mlbam")) else None
+        yr    = int(row["season"])    if pd.notna(row.get("season")) else None
+        if not mlbam or not yr:
+            continue
+        entry = sp_lookup.setdefault((mlbam, yr), {})
+        entry["sp_xwoba_against"] = row.get("sp_xwoba_against", np.nan)
+        entry["sp_barrel_pct"]    = row.get("sp_barrel_pct",    np.nan)
+        entry["sp_hard_hit_pct"]  = row.get("sp_hard_hit_pct",  np.nan)
+        entry["sp_hand"]          = row.get("sp_hand",          np.nan)
 
-    targets = ["tb_per_game", "over_0_5_tb_rate", "over_1_5_tb_rate", "over_2_5_tb_rate"]
-    targets = [t for t in targets if t in df.columns]
-
-    id_cols = ["Name", "Team", "Season", "G", "PA"]
-    id_cols = [c for c in id_cols if c in df.columns]
-
-    final_cols = id_cols + all_features + targets
-    final_cols = [c for c in dict.fromkeys(final_cols) if c in df.columns]
-
-    result = df[final_cols].copy()
-
-    # Impute missing values with feature means
-    feat_means = result[all_features].mean()
-    for col in all_features:
-        n_missing = result[col].isna().sum()
-        if n_missing > 0:
-            result[col] = result[col].fillna(feat_means[col])
-
-    # Filter: need at least 100 PA to be useful
-    if "PA" in result.columns:
-        result = result[pd.to_numeric(result["PA"], errors="coerce") >= 100].copy()
-
-    # Remove rows with no target variable
-    if "tb_per_game" in result.columns:
-        result = result.dropna(subset=["tb_per_game"])
-        # Sanity check: TB per game should be between 0 and 6
-        result = result[(result["tb_per_game"] >= 0) & (result["tb_per_game"] <= 6)]
-
-    print(f"    ✓ Final dataset: {len(result):,} batter-seasons, {len(all_features)} features.")
-    print(f"    ✓ Mean TB/game: {result['tb_per_game'].mean():.3f} (expect ~1.2–1.4)")
-    return result
+    print(f"    SP feature lookup: {len(sp_lookup):,} (mlbam, season) entries")
+    return sp_lookup
 
 
 # =============================================================================
-# MAIN EXECUTION
+# PARSE BATTING ORDER FROM RETROSHEET
+# =============================================================================
+def extract_batting_orders(retro: pd.DataFrame,
+                            retro_to_mlbam: dict) -> list:
+    """
+    Retrosheet logs have columns h_bat_1_id … h_bat_9_id and
+    v_bat_1_id … v_bat_9_id.
+
+    Returns list of dicts, one per batter-game:
+      game_date, season, team_retro, batter_retro_id, batting_slot,
+      sp_retro (the SP they faced), home_flag
+    """
+    if retro.empty:
+        return []
+
+    date_col = next((c for c in ["date", "game_date", "Date", "GameDate"]
+                     if c in retro.columns), None)
+    if not date_col:
+        print("    WARNING: no date column found in retrosheet logs")
+        return []
+
+    rows = []
+    for _, game in retro.iterrows():
+        gdate  = str(game[date_col])[:10]
+        season = int(gdate[:4])
+
+        home_retro = str(game.get("home_team_id", game.get("h_team", "")))
+        away_retro = str(game.get("visiting_team_id", game.get("v_team", "")))
+        h_sp = str(game.get("h_starting_pitcher_id", ""))
+        v_sp = str(game.get("v_starting_pitcher_id", ""))
+
+        # Home batters face away SP (v_sp)
+        for slot in range(1, 10):
+            bat_col = f"h_bat_{slot}_id"
+            if bat_col in game.index and pd.notna(game[bat_col]):
+                rows.append({
+                    "game_date":    gdate,
+                    "season":       season,
+                    "team_retro":   home_retro,
+                    "batter_retro": str(game[bat_col]),
+                    "batting_slot": slot,
+                    "sp_retro":     v_sp,
+                    "home_flag":    1,
+                })
+
+        # Away batters face home SP (h_sp)
+        for slot in range(1, 10):
+            bat_col = f"v_bat_{slot}_id"
+            if bat_col in game.index and pd.notna(game[bat_col]):
+                rows.append({
+                    "game_date":    gdate,
+                    "season":       season,
+                    "team_retro":   away_retro,
+                    "batter_retro": str(game[bat_col]),
+                    "batting_slot": slot,
+                    "sp_retro":     h_sp,
+                    "home_flag":    0,
+                })
+
+    print(f"    Extracted {len(rows):,} batter-game appearances from retrosheet")
+    return rows
+
+
+# =============================================================================
+# EXTRACT ACTUAL TB OUTCOMES FROM RETROSHEET
+# =============================================================================
+def extract_tb_actuals(retro: pd.DataFrame) -> pd.DataFrame:
+    """
+    Retrosheet game logs carry per-batter box-score columns:
+      h_bat_1_1b, h_bat_1_2b, h_bat_1_3b, h_bat_1_hr  (and v_ equivalents).
+
+    Returns DataFrame keyed by (game_date, batter_retro) with tb_actual.
+
+    NOTE: standard retrosheet game log files include only lineup IDs, not
+    individual hit totals.  The detailed extended files (retrosheet event files)
+    carry hit-by-hit data, but the pybaseball helper returns the summary logs.
+    If tb_actual is all NaN after this function, you must supplement with an
+    external source (e.g., Baseball Reference game logs API or statcast
+    per-game batter data via pyb.statcast()).
+    """
+    if retro.empty:
+        return pd.DataFrame()
+
+    date_col = next((c for c in ["date", "game_date", "Date", "GameDate"]
+                     if c in retro.columns), None)
+
+    records = []
+    for _, game in retro.iterrows():
+        gdate = str(game[date_col])[:10]
+        for side in ["h", "v"]:
+            for slot in range(1, 10):
+                bid = str(game.get(f"{side}_bat_{slot}_id", ""))
+                s1b = pd.to_numeric(game.get(f"{side}_bat_{slot}_1b", np.nan),
+                                    errors="coerce")
+                s2b = pd.to_numeric(game.get(f"{side}_bat_{slot}_2b", np.nan),
+                                    errors="coerce")
+                s3b = pd.to_numeric(game.get(f"{side}_bat_{slot}_3b", np.nan),
+                                    errors="coerce")
+                shr = pd.to_numeric(game.get(f"{side}_bat_{slot}_hr", np.nan),
+                                    errors="coerce")
+
+                if any(pd.notna(v) for v in [s1b, s2b, s3b, shr]):
+                    tb = (
+                        np.nan_to_num(s1b, 0) * 1
+                        + np.nan_to_num(s2b, 0) * 2
+                        + np.nan_to_num(s3b, 0) * 3
+                        + np.nan_to_num(shr, 0) * 4
+                    )
+                    records.append({
+                        "game_date":    gdate,
+                        "batter_retro": bid,
+                        "tb_actual":    min(int(tb), 4),  # cap 4+ → class 4
+                    })
+
+    if not records:
+        return pd.DataFrame()
+    return pd.DataFrame(records)
+
+
+# =============================================================================
+# ASSEMBLE FINAL DATASET
+# =============================================================================
+def build_dataset(raw: dict) -> pd.DataFrame:
+    print("\n  Building ID maps...")
+    retro_to_mlbam, mlbam_to_fg = build_id_map(raw["chad"])
+
+    print("\n  Building batter feature lookups...")
+    batter_lookup = build_batter_features(raw["bat_exp"], raw["bat_ev"])
+
+    print("\n  Building platoon feature lookups...")
+    platoon_lookup = build_platoon_features(raw["splits_lhp"], raw["splits_rhp"])
+
+    print("\n  Building SP feature lookups...")
+    sp_lookup = build_sp_features(raw["pit_exp"], raw["pit_arsenal"])
+
+    print("\n  Extracting batting orders from retrosheet logs...")
+    batting_rows = extract_batting_orders(raw["retro"], retro_to_mlbam)
+
+    print("\n  Extracting actual total-bases targets from retrosheet logs...")
+    tb_actuals = extract_tb_actuals(raw["retro"])
+
+    if not batting_rows:
+        print("  ERROR: No batting order rows extracted. Check retrosheet data.")
+        return pd.DataFrame()
+
+    df = pd.DataFrame(batting_rows)
+
+    # Map retro IDs → MLBAM
+    df["batter_mlbam"] = df["batter_retro"].map(retro_to_mlbam)
+    df["sp_mlbam"]     = df["sp_retro"].map(retro_to_mlbam)
+    df["team"]         = df["team_retro"].map(RETRO_TO_STD).fillna(df["team_retro"])
+    df["pa_proj"]      = df["batting_slot"].map(SLOT_PA_PROJ)
+
+    # ── Batter features (prior-year Statcast) ─────────────────────────────
+    bat_feat_cols = ["xba", "xslg", "xwoba", "ev_avg", "la_avg",
+                     "barrel_pct", "hard_hit_pct"]
+    for col in bat_feat_cols:
+        df[col] = np.nan
+
+    for idx, row in df.iterrows():
+        mlbam = row["batter_mlbam"]
+        yr    = row["season"]
+        if pd.notna(mlbam) and pd.notna(yr):
+            feat = batter_lookup.get((int(mlbam), int(yr) - 1), {})
+            for col in bat_feat_cols:
+                df.at[idx, col] = feat.get(col, np.nan)
+
+    # ── SP features (prior-year) ──────────────────────────────────────────
+    sp_feat_cols = ["sp_hand", "sp_xwoba_against", "sp_barrel_pct",
+                    "sp_hard_hit_pct", "sp_fb_velo", "sp_fb_spin",
+                    "sp_fb_h_break", "sp_fb_v_break", "sp_fb_whiff_pct",
+                    "sp_fb_usage", "sp_os_whiff_pct", "sp_os_usage"]
+    for col in sp_feat_cols:
+        df[col] = np.nan
+
+    for idx, row in df.iterrows():
+        mlbam = row["sp_mlbam"]
+        yr    = row["season"]
+        if pd.notna(mlbam) and pd.notna(yr):
+            feat = sp_lookup.get((int(mlbam), int(yr) - 1), {})
+            for col in sp_feat_cols:
+                df.at[idx, col] = feat.get(col, np.nan)
+
+    # ── Platoon features (batter vs SP handedness) ─────────────────────────
+    plat_feat_cols = ["wrc_plus_vs_hand", "woba_vs_hand",
+                      "k_pct_vs_hand", "iso_vs_hand"]
+    for col in plat_feat_cols:
+        df[col] = np.nan
+
+    for idx, row in df.iterrows():
+        mlbam = row["batter_mlbam"]
+        yr    = row["season"]
+        hand  = row.get("sp_hand")
+        if pd.notna(mlbam) and pd.notna(yr) and pd.notna(hand):
+            fgid = mlbam_to_fg.get(int(mlbam))
+            if fgid:
+                feat = platoon_lookup.get((int(fgid), int(yr) - 1, str(hand)), {})
+                df.at[idx, "wrc_plus_vs_hand"] = feat.get("wrc_plus", np.nan)
+                df.at[idx, "woba_vs_hand"]     = feat.get("woba",     np.nan)
+                df.at[idx, "k_pct_vs_hand"]    = feat.get("k_pct",    np.nan)
+                df.at[idx, "iso_vs_hand"]       = feat.get("iso",      np.nan)
+
+    # ── Interaction features ──────────────────────────────────────────────
+    df["ev_vs_sp_xwoba"]      = df["ev_avg"] * df["sp_xwoba_against"]
+    df["barrel_vs_sp_barrel"] = df["barrel_pct"] - df["sp_barrel_pct"]
+
+    # ── Merge actual TB outcomes ──────────────────────────────────────────
+    if not tb_actuals.empty:
+        df = pd.merge(df, tb_actuals,
+                      on=["game_date", "batter_retro"], how="left")
+        n_labeled = df["tb_actual"].notna().sum()
+        print(f"\n    TB actuals merged: {n_labeled:,} / {len(df):,} rows labeled")
+    else:
+        df["tb_actual"] = np.nan
+        print("\n    WARNING: No TB actuals found in retrosheet logs.")
+        print("    Retrosheet summary game logs carry lineup IDs only — not hit totals.")
+        print("    Supplement with Baseball Reference or Statcast per-game batter data.")
+
+    # Keep only labeled rows for training
+    df_train = df.dropna(subset=["tb_actual"]).copy()
+    df_train["tb_actual"] = df_train["tb_actual"].astype(int)
+    print(f"\n    Training-eligible rows (labeled): {len(df_train):,}")
+    if len(df_train) > 0:
+        print(f"    TB distribution:\n{df_train['tb_actual'].value_counts().sort_index()}")
+
+    return df_train
+
+
+# =============================================================================
+# MAIN
 # =============================================================================
 if __name__ == "__main__":
     print("=" * 70)
-    print("HITTER TOTAL BASES MODEL — STEP 2: DATASET CONSTRUCTION")
+    print("HITTER TB MODEL — STEP 2: FEATURE ENGINEERING (REFACTORED)")
     print("=" * 70)
 
-    print("\n[ 1/4 ] Loading raw data...")
-    data = load_raw_data()
+    print("\n[ 1/3 ] Loading raw data...")
+    raw = load_raw()
 
-    print("\n[ 2/4 ] Building batter features...")
-    batter_df = build_batter_features(data)
+    print("\n[ 2/3 ] Building dataset...")
+    df = build_dataset(raw)
 
-    print("\n[ 3/4 ] Building pitcher matchup features...")
-    pitcher_df = build_pitcher_matchup_features(data)
+    if df.empty:
+        print("\nERROR: Empty dataset.  Run 01_input_hitter_tb.py first and verify "
+              "that retrosheet logs contain box-score hit columns.")
+        exit(1)
 
-    print("\n[ 4/4 ] Building final dataset...")
-    matchup_df = build_matchup_dataset(batter_df, pitcher_df)
-    final_df   = finalize_dataset(matchup_df)
-
-    # Save processed dataset
-    output_path = os.path.join(PROC_DIR, "hitter_tb_dataset.csv")
-    final_df.to_csv(output_path, index=False)
-    print(f"\n  ✓ Saved hitter_tb_dataset.csv ({len(final_df):,} rows)")
-
-    # Also save the pitcher matchup lookup separately for use in scoring
-    if not pitcher_df.empty:
-        pit_path = os.path.join(PROC_DIR, "pitcher_matchup_lookup.csv")
-        pitcher_df.to_csv(pit_path, index=False)
-        print(f"  ✓ Saved pitcher_matchup_lookup.csv ({len(pitcher_df):,} rows)")
+    print(f"\n[ 3/3 ] Saving dataset...")
+    out_path = os.path.join(PROC_DIR, "hitter_tb_dataset.csv")
+    df.to_csv(out_path, index=False)
+    print(f"  ✓ {len(df):,} rows saved → {out_path}")
+    print(f"  Columns: {list(df.columns)}")
 
     print("\n" + "=" * 70)
     print("STEP 2 COMPLETE — Run 03_analysis_hitter_tb.py next.")

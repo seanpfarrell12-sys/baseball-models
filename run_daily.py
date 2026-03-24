@@ -190,6 +190,17 @@ def run_pitcher_outs():
     return edge_report
 
 
+def run_nrfi():
+    m = load_export_module("nrfi", "04_export_nrfi.py")
+    df = m.run_nrfi_export(target_date=today_str, verbose=True)
+    if df is None or df.empty:
+        print("  No NRFI/YRFI games scored — skipping.")
+        return None
+    picks = df[df.get("bet_side", pd.Series()) != ""] if "bet_side" in df.columns else df
+    print(f"  ✓ {len(df)} games scored | {len(picks)} picks")
+    return df
+
+
 # =============================================================================
 # MAIN
 # =============================================================================
@@ -206,6 +217,7 @@ if __name__ == "__main__":
         ("Totals O/U",   run_totals),
         ("Hitter TB",    run_hitter_tb),
         ("Pitcher Outs", run_pitcher_outs),
+        ("NRFI/YRFI",    run_nrfi),
     ]
 
     results = {}
@@ -239,6 +251,7 @@ if __name__ == "__main__":
         "Totals O/U":   "Totals",
         "Hitter TB":    "Hitter TB",
         "Pitcher Outs": "Pitcher Outs",
+        "NRFI/YRFI":    "NRFI-YRFI",
     }
     with pd.ExcelWriter(combined_path, engine="openpyxl") as writer:
         for name, report in results.items():

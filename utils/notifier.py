@@ -215,6 +215,14 @@ MODEL_CONFIGS = {
         "sms_label":   "PO",
         "emoji":       "⚾",
     },
+    "NRFI/YRFI": {
+        "subject_col": None,          # game-level market; subject built from team cols
+        "line_col":    None,
+        "odds_col":    "bet_odds",
+        "edge_col":    "edge",
+        "sms_label":   "NR",
+        "emoji":       "1️⃣",
+    },
 }
 
 
@@ -363,7 +371,7 @@ def _format_discord_results(grade_date: str) -> tuple:
     pnl    = pd.to_numeric(day["pnl"], errors="coerce").fillna(0).sum()
     pnl   -= losses * 100
 
-    for model in ["Moneyline", "Totals", "Hitter TB", "Pitcher Outs"]:
+    for model in ["Moneyline", "Totals", "Hitter TB", "Pitcher Outs", "NRFI/YRFI"]:
         sub = day[day["model"] == model]
         if sub.empty:
             continue

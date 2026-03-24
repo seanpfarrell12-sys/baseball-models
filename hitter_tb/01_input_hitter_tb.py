@@ -1,423 +1,327 @@
 """
 =============================================================================
-HITTER TOTAL BASES MODEL — FILE 1 OF 4: DATA INPUT
+HITTER TOTAL BASES MODEL — FILE 1 OF 4: DATA INPUT  (REFACTORED)
 =============================================================================
-Purpose : Pull all raw data needed for the hitter total bases XGBoost model.
-Sources : FanGraphs (via pybaseball), Baseball Savant/Statcast (via pybaseball)
-Output  : CSV files saved to ../data/raw/
+Purpose : Pull all raw data needed for the hitter total bases model.
 
-Total Bases background:
-  - Total Bases = 1B×1 + 2B×2 + 3B×3 + HR×4
-  - Market: "Will Player X get over/under 1.5 total bases today?"
-  - Key signals: Barrel%, EV, Hard-Hit%, launch angle consistency,
-    pitcher matchup (handedness, pitch mix, K/BB tendency), park factor.
+Key design changes from prior version:
+  - ALL joins use MLBAM (key_mlbam) numeric IDs, not name strings.
+    This eliminates the "0 hitters matched" merge failure in the old code.
+  - Chadwick Bureau register bridges Savant MLBAM ↔ FanGraphs IDfg.
+  - Added retrosheet game logs for confirmed SP identity each game.
+  - Added batting-order / lineup-position data from game logs.
+  - Pitcher arsenal data structured per-PA simulation (by MLBAM, season).
 
-Why Statcast matters here:
-  - Traditional stats (AVG, SLG) are outcome-based and noisy.
-  - Statcast metrics measure the QUALITY of contact — a leading indicator.
-  - A hitter with high Barrel% but low AVG is due for positive regression.
-  - We're modeling the underlying process, not just past results.
+Data sources:
+  1. Chadwick Bureau register         — ID crosswalk (MLBAM ↔ FGid)
+  2. Retrosheet game logs             — confirmed SP + batting order slot
+  3. Statcast batter expected stats   — xBA, xSLG, xwOBA per batter/season
+  4. Statcast batter EV / barrel      — exit_velocity_avg, barrel_batted_rate,
+                                        launch_angle_avg, hard_hit_percent
+  5. FanGraphs batting splits         — wRC+, wOBA, ISO, K%, BB% vs LHP/RHP
+  6. Statcast pitcher arsenal stats   — pitch-type velo, break, whiff% per SP
+  7. Statcast pitcher expected stats  — xwOBA against, barrel%, hard_hit% per SP
 
-Data sources used:
-  1. FanGraphs batting stats — wOBA, ISO, BB%, K%, platoon splits
-  2. Baseball Savant exit velocity/barrel stats — Barrel%, HardHit%, EV, LA
-  3. Baseball Savant expected stats — xBA, xSLG, xwOBA
-  4. FanGraphs pitching stats — for matchup features (SP faced each game)
-  5. Baseball Savant pitch arsenal data — SP pitch mix by type
-
-For R users:
-  - Statcast data comes from Baseball Savant (savant.baseball)
-  - pybaseball wraps the Savant API so we don't need to scrape HTML
-  - `statcast_batter_exitvelo_barrels()` = season-level EV/barrel aggregates
+Input  : none (pulls from pybaseball / APIs)
+Output : data/raw/
+          raw_chadwick.csv
+          raw_retrosheet_*.csv        (one per game year)
+          raw_batter_expected.csv
+          raw_batter_ev_barrels.csv
+          raw_batting_splits_lhp.csv
+          raw_batting_splits_rhp.csv
+          raw_pitcher_arsenal.csv
+          raw_pitcher_expected.csv
 =============================================================================
 """
 
 import os
 import time
+import warnings
+import requests
 import pandas as pd
 import numpy as np
 import pybaseball as pyb
 from datetime import date as _date
 
+warnings.filterwarnings("ignore")
 pyb.cache.enable()
 
-# --- Configuration ----------------------------------------------------------
-BASE_DIR     = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-RAW_DIR      = os.path.join(BASE_DIR, "data", "raw")
-TRAIN_YEARS  = [2023, 2024, 2025]
-CURRENT_YEAR = _date.today().year   # 2026 — refreshed each run
+BASE_DIR    = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+RAW_DIR     = os.path.join(BASE_DIR, "data", "raw")
+os.makedirs(RAW_DIR, exist_ok=True)
 
-# Minimum plate appearances to include a batter (filters small samples)
-MIN_PA = 150
-
-# Minimum batted ball events for Statcast barrel/EV data
-MIN_BBE = 75
+STAT_YEARS  = [2022, 2023, 2024, 2025]   # feature years (prior-year features)
+GAME_YEARS  = [2023, 2024, 2025]          # years with confirmed game outcomes
+MIN_PA      = 100                         # minimum PA to include a batter
 
 
 # =============================================================================
-# FUNCTION 1: Pull Statcast Exit Velocity and Barrel Data
+# 1. CHADWICK BUREAU REGISTER  (MLBAM ↔ FanGraphs ID bridge)
 # =============================================================================
-def pull_statcast_ev_barrels(years: list) -> pd.DataFrame:
+def pull_chadwick_register() -> pd.DataFrame:
+    print("  Pulling Chadwick Bureau register...")
+    chad = pyb.chadwick_register()
+    chad = chad[["key_mlbam", "key_fangraphs", "name_first", "name_last"]].copy()
+    chad = chad.dropna(subset=["key_mlbam", "key_fangraphs"])
+    chad["key_mlbam"]    = chad["key_mlbam"].astype(int)
+    chad["key_fangraphs"] = chad["key_fangraphs"].astype(int)
+    out = os.path.join(RAW_DIR, "raw_chadwick.csv")
+    chad.to_csv(out, index=False)
+    print(f"    Saved {len(chad):,} rows → {out}")
+    return chad
+
+
+# =============================================================================
+# 2. RETROSHEET GAME LOGS  (SP identity + batting order)
+# =============================================================================
+def pull_retrosheet_logs(game_years: list) -> pd.DataFrame:
     """
-    Pull season-level exit velocity and barrel statistics per batter.
+    Retrosheet game logs contain:
+      h_starting_pitcher_id / v_starting_pitcher_id  — retrosheet pitcher IDs
+      h_bat_1_id … h_bat_9_id                         — home batting order
+      v_bat_1_id … v_bat_9_id                         — away batting order
 
-    This is the heart of the total bases model — Statcast quality-of-contact
-    metrics are far more predictive than traditional batting stats.
-
-    Key columns returned:
-      - avg_hit_speed    : Mean exit velocity (mph) — higher = harder contact
-      - ev95plus         : Number of batted balls hit 95+ mph (Hard-Hit count)
-      - ev95percent      : Hard-Hit rate (% of BBE at 95+ mph)
-      - barrels          : Count of barrels (optimal EV + launch angle combos)
-      - brl_percent      : Barrel % (barrels per PA) — strongest HR/XBH predictor
-      - anglesweetspotpct: % of batted balls in "sweet spot" (8–32° launch angle)
-      - avg_hit_angle    : Mean launch angle
-
-    In R, you'd access this data through a manual Savant export CSV.
-    pybaseball automates this download.
-
-    Parameters
-    ----------
-    years : list of int
-
-    Returns
-    -------
-    pd.DataFrame
-        One row per batter per season with exit velocity stats.
+    We save one CSV per year then concatenate.
     """
-    all_ev = []
-
-    for year in years:
-        print(f"  Pulling Statcast EV/barrel data for {year}...")
+    frames = []
+    for yr in game_years:
+        print(f"  Pulling retrosheet game log {yr}...")
         try:
-            # minBBE: minimum batted ball events for inclusion
-            # Filters out pitchers and very part-time players
-            df = pyb.statcast_batter_exitvelo_barrels(year, minBBE=MIN_BBE)
-            df["Season"] = year
-            all_ev.append(df)
-            time.sleep(2)
+            gl = pyb.retrosheet_game_log(yr)
+            out = os.path.join(RAW_DIR, f"raw_retrosheet_{yr}.csv")
+            gl.to_csv(out, index=False)
+            print(f"    {len(gl):,} games saved → {out}")
+            frames.append(gl)
+            time.sleep(1)
         except Exception as e:
-            print(f"    WARNING: EV/barrel pull failed for {year}: {e}")
-
-    ev_df = pd.concat(all_ev, ignore_index=True)
-
-    # Rename columns to be more descriptive (Savant uses abbreviated names)
-    # In R: names(df)[names(df) == "old"] <- "new"
-    rename_map = {
-        "last_name, first_name": "player_name",  # Savant format: "Smith, John"
-        "avg_hit_speed":         "avg_exit_velo",
-        "ev95percent":           "hard_hit_pct",
-        "ev95plus":              "hard_hit_count",
-        "brl_percent":           "barrel_pct",
-        "brl_pa":                "barrel_per_pa",
-        "anglesweetspotpercent": "sweet_spot_pct",
-        "avg_hit_angle":         "avg_launch_angle",
-    }
-    # Only rename columns that actually exist
-    rename_map = {k: v for k, v in rename_map.items() if k in ev_df.columns}
-    ev_df = ev_df.rename(columns=rename_map)
-
-    print(f"  ✓ EV/barrel data: {len(ev_df):,} batter-seasons pulled.")
-    return ev_df
+            print(f"    WARNING: retrosheet {yr} failed — {e}")
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
 
 
 # =============================================================================
-# FUNCTION 2: Pull Statcast Expected Stats (xBA, xSLG, xwOBA)
+# 3. STATCAST BATTER EXPECTED STATS  (xBA, xSLG, xwOBA per MLBAM/season)
 # =============================================================================
-def pull_statcast_expected_stats(years: list) -> pd.DataFrame:
-    """
-    Pull Statcast 'expected' outcome statistics per batter.
-
-    Expected stats use exit velocity and launch angle to predict what a
-    player's batting average, slugging, and wOBA SHOULD be, removing
-    the influence of defense, park, and batted ball luck.
-
-    Key columns:
-      - est_ba     (xBA)   : Expected batting average
-      - est_slg    (xSLG)  : Expected slugging percentage
-      - est_woba   (xwOBA) : Expected weighted on-base average
-      - est_woba_minus_woba_diff : Positive = hitter got unlucky (due for upswing)
-                                   Negative = hitter got lucky (due for regression)
-
-    The difference between actual and expected is a powerful luck indicator.
-    """
-    all_xstats = []
-
-    for year in years:
-        print(f"  Pulling Statcast expected stats for {year}...")
+def pull_batter_expected_stats(stat_years: list) -> pd.DataFrame:
+    frames = []
+    for yr in stat_years:
+        print(f"  Pulling batter expected stats {yr}...")
         try:
-            df = pyb.statcast_batter_expected_stats(year, minPA=MIN_PA)
-            df["Season"] = year
-            all_xstats.append(df)
-            time.sleep(2)
+            df = pyb.statcast_batter_expected_stats(yr, minPA=MIN_PA)
+            df["season"] = yr
+            frames.append(df)
+            time.sleep(1)
         except Exception as e:
-            print(f"    WARNING: Expected stats pull failed for {year}: {e}")
-
-    if all_xstats:
-        xstats_df = pd.concat(all_xstats, ignore_index=True)
-        print(f"  ✓ Expected stats: {len(xstats_df):,} batter-seasons pulled.")
-        return xstats_df
-    return pd.DataFrame()
-
-
-# =============================================================================
-# FUNCTION 3: Pull FanGraphs Batting Stats (Platoon + Advanced)
-# =============================================================================
-def pull_batting_stats(years: list) -> pd.DataFrame:
-    """
-    Pull batter-season stats from FanGraphs for modeling features.
-
-    Key metrics for total bases modeling:
-      - wOBA / xwOBA  : Overall hitting quality (context-neutral)
-      - ISO           : Isolated power (SLG - AVG), pure extra-base hit rate
-      - wRC+          : Park-adjusted offensive value
-      - K%, BB%       : Strikeout and walk rates (plate discipline)
-      - Pull%, Cent%  : Batted ball direction tendencies
-
-    We also derive:
-      - 1B = H - 2B - 3B - HR  (singles)
-      - TB per G = (1B + 2×2B + 3×3B + 4×HR) / G  (our training target)
-    """
-    all_bat = []
-
-    for year in years:
-        print(f"  Pulling FanGraphs batting stats for {year}...")
-        df = pyb.batting_stats(year, year, qual=MIN_PA, ind=1)
-        df["Season"] = year
-        all_bat.append(df)
-        time.sleep(2)
-
-    batting = pd.concat(all_bat, ignore_index=True)
-
-    # Compute total bases per game — this is our model's TARGET variable
-    # TB = 1B + 2×2B + 3×3B + 4×HR
-    # In R: batting$singles <- batting$H - batting$`2B` - batting$`3B` - batting$HR
-    if all(c in batting.columns for c in ["H", "2B", "3B", "HR", "G"]):
-        batting["singles"] = batting["H"] - batting["2B"] - batting["3B"] - batting["HR"]
-        batting["total_bases"]       = (
-            batting["singles"]
-            + 2 * batting["2B"]
-            + 3 * batting["3B"]
-            + 4 * batting["HR"]
-        )
-        batting["tb_per_game"]       = batting["total_bases"] / batting["G"]
-        # For prop bets, we need TB per game as our label
-        # Market typically sets line at 1.5 TB (over/under 1.5)
-        batting["over_1_5_tb_rate"]  = (batting["tb_per_game"] >= 1.5).astype(float)
-        batting["over_0_5_tb_rate"]  = (batting["tb_per_game"] >= 0.5).astype(float)
-
-    print(f"  ✓ Batting stats: {len(batting):,} batter-seasons pulled.")
-    return batting
+            print(f"    WARNING: batter expected {yr} failed — {e}")
+    if not frames:
+        return pd.DataFrame()
+    out_df = pd.concat(frames, ignore_index=True)
+    # Savant uses 'player_id' as the MLBAM identifier
+    if "player_id" in out_df.columns:
+        out_df.rename(columns={"player_id": "key_mlbam"}, inplace=True)
+    out_df["key_mlbam"] = pd.to_numeric(out_df["key_mlbam"], errors="coerce")
+    out = os.path.join(RAW_DIR, "raw_batter_expected.csv")
+    out_df.to_csv(out, index=False)
+    print(f"    Saved {len(out_df):,} rows → {out}")
+    return out_df
 
 
 # =============================================================================
-# FUNCTION 4: Pull Pitcher Pitch Arsenal Stats (Matchup Features)
+# 4. STATCAST BATTER EV / BARREL  (exit_velocity_avg, barrel_batted_rate, etc.)
 # =============================================================================
-def pull_pitcher_arsenal(years: list) -> pd.DataFrame:
+def pull_batter_ev_barrels(stat_years: list) -> pd.DataFrame:
     """
-    Pull pitcher pitch-type arsenal data from Baseball Savant.
-
-    For the hitter total bases model, matchup quality depends heavily on
-    what pitches the opposing starter THROWS — not just their overall ERA.
-
-    A hitter who crushes fastballs but struggles against sliders will have
-    lower expected TB against a slider-heavy starter.
-
-    Key columns:
-      - pitch_type     : FA (4-seam fastball), SI (sinker), SL (slider), etc.
-      - avg_speed      : Mean velocity for that pitch type
-      - usage_pct      : How often they throw that pitch (0–100%)
-      - avg_spin_rate  : RPM (higher spin = more movement)
-
-    This is joined to each game's starting pitcher in the build step.
+    statcast_batter_exitvelo_barrels() returns MLBAM 'player_id'.
+    We rename to key_mlbam for consistency — no name-based matching needed.
     """
-    all_arsenal = []
-
-    for year in years:
-        print(f"  Pulling pitcher pitch arsenal for {year}...")
+    frames = []
+    for yr in stat_years:
+        print(f"  Pulling batter EV/barrel stats {yr}...")
         try:
-            # arsenal_type options: 'avg_speed', 'n_', 'usage', etc.
-            df = pyb.statcast_pitcher_pitch_arsenal(
-                year, minP=100, arsenal_type="avg_speed"
-            )
-            df["Season"] = year
-            all_arsenal.append(df)
-            time.sleep(2)
+            df = pyb.statcast_batter_exitvelo_barrels(yr, minBBE=50)
+            df["season"] = yr
+            frames.append(df)
+            time.sleep(1)
         except Exception as e:
-            print(f"    WARNING: Pitch arsenal pull failed for {year}: {e}")
-
-    if all_arsenal:
-        arsenal = pd.concat(all_arsenal, ignore_index=True)
-        print(f"  ✓ Pitcher arsenal: {len(arsenal):,} pitcher-season-pitch-type rows.")
-        return arsenal
-    return pd.DataFrame()
+            print(f"    WARNING: batter EV/barrel {yr} failed — {e}")
+    if not frames:
+        return pd.DataFrame()
+    out_df = pd.concat(frames, ignore_index=True)
+    if "player_id" in out_df.columns:
+        out_df.rename(columns={"player_id": "key_mlbam"}, inplace=True)
+    out_df["key_mlbam"] = pd.to_numeric(out_df["key_mlbam"], errors="coerce")
+    out = os.path.join(RAW_DIR, "raw_batter_ev_barrels.csv")
+    out_df.to_csv(out, index=False)
+    print(f"    Saved {len(out_df):,} rows → {out}")
+    return out_df
 
 
 # =============================================================================
-# FUNCTION 5: Pull Pitcher Expected Stats (for Matchup Quality)
+# 5. FANGRAPHS BATTING SPLITS  (wRC+, wOBA, ISO, K%, BB% vs LHP and RHP)
 # =============================================================================
-def pull_pitcher_xstats(years: list) -> pd.DataFrame:
-    """
-    Pull Statcast expected stats for pitchers (xwOBA allowed, xERA).
+SPLIT_CODES = {
+    "vs_lhp": 117,   # vs Left-Handed Pitcher
+    "vs_rhp": 118,   # vs Right-Handed Pitcher
+}
 
-    These tell us the QUALITY of contact a pitcher allows.
-    A pitcher with high ERA but low xERA is getting unlucky — hitters
-    are actually NOT making great contact, so they'd be a poor matchup
-    for a "Over" total bases bet.
+def pull_batting_splits(stat_years: list) -> tuple:
     """
-    all_pit = []
+    FanGraphs splits API returns season-level splits by PA split code.
+    Returns (df_lhp, df_rhp) DataFrames with IDfg for joining.
+    """
+    base_url = "https://www.fangraphs.com/api/leaders/splits/splits-leaders"
 
-    for year in years:
-        print(f"  Pulling pitcher Statcast xstats for {year}...")
+    def _fetch_split(split_code: int, split_label: str,
+                     year: int) -> pd.DataFrame:
+        params = {
+            "strPos":       "all",
+            "season":       year,
+            "season1":      year,
+            "mingames":     0,
+            "minpa":        MIN_PA,
+            "split":        split_code,
+            "splitTeams":   False,
+            "statType":     "player",
+            "statgroup":    "dashboard",
+            "startDate":    f"{year}-01-01",
+            "endDate":      f"{year}-12-31",
+            "players":      "",
+            "z_players":    "",
+        }
+        headers = {"User-Agent": "baseball-model-research/1.0"}
         try:
-            df = pyb.statcast_pitcher_expected_stats(year, minPA=50)
-            df["Season"] = year
-            all_pit.append(df)
-            time.sleep(2)
+            r = requests.get(base_url, params=params, headers=headers,
+                             timeout=30)
+            r.raise_for_status()
+            data = r.json()
+            rows = data.get("data", data) if isinstance(data, dict) else data
+            df   = pd.DataFrame(rows)
+            df["season"]      = year
+            df["split_label"] = split_label
+            return df
         except Exception as e:
-            print(f"    WARNING: Pitcher xstats failed for {year}: {e}")
+            print(f"      WARNING: FG splits {split_label} {year} — {e}")
+            return pd.DataFrame()
 
-    if all_pit:
-        pit_df = pd.concat(all_pit, ignore_index=True)
-        print(f"  ✓ Pitcher xstats: {len(pit_df):,} pitcher-seasons pulled.")
-        return pit_df
-    return pd.DataFrame()
+    lhp_frames, rhp_frames = [], []
+    for yr in stat_years:
+        print(f"  Pulling FG batting splits {yr}...")
+        lhp_frames.append(_fetch_split(SPLIT_CODES["vs_lhp"], "vs_lhp", yr))
+        rhp_frames.append(_fetch_split(SPLIT_CODES["vs_rhp"], "vs_rhp", yr))
+        time.sleep(1.5)
+
+    df_lhp = pd.concat([f for f in lhp_frames if not f.empty], ignore_index=True)
+    df_rhp = pd.concat([f for f in rhp_frames if not f.empty], ignore_index=True)
+
+    # FanGraphs batting data uses "playerid" or "IDfg"
+    for df in [df_lhp, df_rhp]:
+        for col in ["playerid", "IDfg", "PlayerID"]:
+            if col in df.columns:
+                df.rename(columns={col: "IDfg"}, inplace=True)
+                break
+        if "IDfg" in df.columns:
+            df["IDfg"] = pd.to_numeric(df["IDfg"], errors="coerce")
+
+    out_lhp = os.path.join(RAW_DIR, "raw_batting_splits_lhp.csv")
+    out_rhp = os.path.join(RAW_DIR, "raw_batting_splits_rhp.csv")
+    df_lhp.to_csv(out_lhp, index=False)
+    df_rhp.to_csv(out_rhp, index=False)
+    print(f"    LHP splits: {len(df_lhp):,} rows → {out_lhp}")
+    print(f"    RHP splits: {len(df_rhp):,} rows → {out_rhp}")
+    return df_lhp, df_rhp
 
 
 # =============================================================================
-# FUNCTION 6: Pull FanGraphs Pitcher Stats (K%, BB%, handedness)
+# 6. STATCAST PITCHER ARSENAL STATS  (pitch-type level data per SP, per season)
 # =============================================================================
-def pull_fg_pitcher_stats(years: list) -> pd.DataFrame:
+FASTBALL_TYPES  = {"FF", "SI", "FT", "FC"}
+OFFSPEED_TYPES  = {"SL", "CU", "CH", "KC", "FS", "EP", "KN", "SC"}
+
+def pull_pitcher_arsenal(stat_years: list) -> pd.DataFrame:
     """
-    Pull FanGraphs pitcher stats needed for matchup features.
-
-    Key features for the hitter TB matchup:
-      - K%          : Higher K% = worse matchup for hitters (fewer balls in play)
-      - BB%         : Higher BB% = more base runners (indirect boost to TB value)
-      - SIERA       : Overall quality — better pitchers = lower expected TB
-      - SwStr%      : Swing-and-miss rate — hard to make contact at all
-      - Left/Right  : Pitcher handedness (platoon advantage/disadvantage)
+    Returns one row per (pitcher_id, pitch_type, season).
+    Columns include: avg_speed, spin_rate, pfx_x, pfx_z, whiff_percent,
+                     pitch_percent (usage rate).
+    MLBAM pitcher_id retained for joins.
     """
-    all_pit = []
-
-    for year in years:
-        print(f"  Pulling FanGraphs pitcher stats for {year}...")
-        df = pyb.pitching_stats(year, year, qual=0, ind=1)
-        df["Season"] = year
-        if "GS" in df.columns:
-            df = df[df["GS"] >= 5]  # Starters only
-        all_pit.append(df)
-        time.sleep(2)
-
-    pitching = pd.concat(all_pit, ignore_index=True)
-    print(f"  ✓ FG pitcher stats: {len(pitching):,} starter-seasons pulled.")
-    return pitching
+    frames = []
+    for yr in stat_years:
+        print(f"  Pulling pitcher arsenal stats {yr}...")
+        try:
+            df = pyb.statcast_pitcher_arsenal_stats(yr, minP=100)
+            df["season"] = yr
+            frames.append(df)
+            time.sleep(1)
+        except Exception as e:
+            print(f"    WARNING: pitcher arsenal {yr} failed — {e}")
+    if not frames:
+        return pd.DataFrame()
+    out_df = pd.concat(frames, ignore_index=True)
+    if "pitcher_id" in out_df.columns:
+        out_df.rename(columns={"pitcher_id": "key_mlbam"}, inplace=True)
+    out_df["key_mlbam"] = pd.to_numeric(out_df["key_mlbam"], errors="coerce")
+    out = os.path.join(RAW_DIR, "raw_pitcher_arsenal.csv")
+    out_df.to_csv(out, index=False)
+    print(f"    Saved {len(out_df):,} rows → {out}")
+    return out_df
 
 
 # =============================================================================
-# MAIN EXECUTION
+# 7. STATCAST PITCHER EXPECTED STATS  (xwOBA against, barrel%, hard_hit%)
+# =============================================================================
+def pull_pitcher_expected_stats(stat_years: list) -> pd.DataFrame:
+    frames = []
+    for yr in stat_years:
+        print(f"  Pulling pitcher expected stats {yr}...")
+        try:
+            df = pyb.statcast_pitcher_expected_stats(yr, minIP=10)
+            df["season"] = yr
+            frames.append(df)
+            time.sleep(1)
+        except Exception as e:
+            print(f"    WARNING: pitcher expected {yr} failed — {e}")
+    if not frames:
+        return pd.DataFrame()
+    out_df = pd.concat(frames, ignore_index=True)
+    if "player_id" in out_df.columns:
+        out_df.rename(columns={"player_id": "key_mlbam"}, inplace=True)
+    out_df["key_mlbam"] = pd.to_numeric(out_df["key_mlbam"], errors="coerce")
+    out = os.path.join(RAW_DIR, "raw_pitcher_expected.csv")
+    out_df.to_csv(out, index=False)
+    print(f"    Saved {len(out_df):,} rows → {out}")
+    return out_df
+
+
+# =============================================================================
+# MAIN
 # =============================================================================
 if __name__ == "__main__":
     print("=" * 70)
-    print("HITTER TOTAL BASES MODEL — STEP 1: DATA INPUT")
+    print("HITTER TB MODEL — STEP 1: DATA INPUT (REFACTORED)")
     print("=" * 70)
-    print(f"Pulling data for seasons: {TRAIN_YEARS}")
-    print(f"Minimum PA threshold: {MIN_PA}")
-    print()
 
-    print("[ 1/6 ] Pulling Statcast exit velocity / barrel data...")
-    ev_df = pull_statcast_ev_barrels(TRAIN_YEARS)
+    print("\n[ 1/7 ] Chadwick Bureau register (MLBAM ↔ FanGraphs ID bridge)...")
+    pull_chadwick_register()
 
-    print("\n[ 2/6 ] Pulling Statcast batter expected stats (xBA, xSLG, xwOBA)...")
-    xstats_df = pull_statcast_expected_stats(TRAIN_YEARS)
+    print("\n[ 2/7 ] Retrosheet game logs (confirmed SP + batting order)...")
+    pull_retrosheet_logs(GAME_YEARS)
 
-    print("\n[ 3/6 ] Pulling FanGraphs batting stats...")
-    batting_df = pull_batting_stats(TRAIN_YEARS)
+    print("\n[ 3/7 ] Batter expected stats (xBA, xSLG, xwOBA)...")
+    pull_batter_expected_stats(STAT_YEARS)
 
-    print("\n[ 4/6 ] Pulling pitcher pitch arsenal data...")
-    arsenal_df = pull_pitcher_arsenal(TRAIN_YEARS)
+    print("\n[ 4/7 ] Batter exit velocity / barrel data...")
+    pull_batter_ev_barrels(STAT_YEARS)
 
-    print("\n[ 5/6 ] Pulling pitcher Statcast expected stats...")
-    pitcher_xstats_df = pull_pitcher_xstats(TRAIN_YEARS)
+    print("\n[ 5/7 ] FanGraphs batting splits (vs LHP / vs RHP)...")
+    pull_batting_splits(STAT_YEARS)
 
-    print("\n[ 6/6 ] Pulling FanGraphs pitcher stats (matchup features)...")
-    fg_pitcher_df = pull_fg_pitcher_stats(TRAIN_YEARS)
+    print("\n[ 6/7 ] Pitcher arsenal stats (pitch-type level)...")
+    pull_pitcher_arsenal(STAT_YEARS)
 
-    # --- Save files ----------------------------------------------------------
-    print("\n[ SAVING ] Writing raw data files...")
-
-    save_map = {
-        "raw_hitter_ev_barrels.csv":     ev_df,
-        "raw_hitter_xstats.csv":         xstats_df,
-        "raw_hitter_batting.csv":        batting_df,
-        "raw_pitcher_arsenal.csv":       arsenal_df,
-        "raw_pitcher_xstats.csv":        pitcher_xstats_df,
-        "raw_fg_pitcher_stats.csv":      fg_pitcher_df,
-    }
-
-    # In Python, .items() iterates over key-value pairs in a dict
-    # In R: for (name in names(save_map)) { write.csv(save_map[[name]], ...) }
-    for filename, df in save_map.items():
-        if df is not None and not df.empty:
-            path = os.path.join(RAW_DIR, filename)
-            df.to_csv(path, index=False)
-            print(f"  ✓ {filename:45s} ({len(df):,} rows)")
-
-    # -------------------------------------------------------------------------
-    # REFRESH CURRENT SEASON DATA (re-run weekly to pick up 2026 stats)
-    # -------------------------------------------------------------------------
-    if CURRENT_YEAR not in TRAIN_YEARS:
-        print(f"\n[ REFRESH ] Pulling {CURRENT_YEAR} current-season data...")
-
-        try:
-            cur_bat = pull_batting_stats([CURRENT_YEAR])
-            if not cur_bat.empty:
-                batting_df = pd.concat(
-                    [batting_df[batting_df["Season"] != CURRENT_YEAR], cur_bat],
-                    ignore_index=True,
-                )
-                batting_df.to_csv(os.path.join(RAW_DIR, "raw_hitter_batting.csv"), index=False)
-                print(f"  ✓ Merged {CURRENT_YEAR} batting into raw_hitter_batting.csv")
-        except Exception as e:
-            print(f"  WARNING: Could not pull {CURRENT_YEAR} batting stats — {e}")
-
-        try:
-            cur_ev = pull_statcast_ev_barrels([CURRENT_YEAR])
-            if not cur_ev.empty:
-                ev_df = pd.concat(
-                    [ev_df[ev_df["Season"] != CURRENT_YEAR], cur_ev],
-                    ignore_index=True,
-                )
-                ev_df.to_csv(os.path.join(RAW_DIR, "raw_hitter_ev_barrels.csv"), index=False)
-                print(f"  ✓ Merged {CURRENT_YEAR} EV/barrel data into raw_hitter_ev_barrels.csv")
-        except Exception as e:
-            print(f"  WARNING: Could not pull {CURRENT_YEAR} EV/barrel data — {e}")
-
-        try:
-            cur_xstats = pull_statcast_expected_stats([CURRENT_YEAR])
-            if not cur_xstats.empty:
-                xstats_df = pd.concat(
-                    [xstats_df[xstats_df["Season"] != CURRENT_YEAR], cur_xstats],
-                    ignore_index=True,
-                )
-                xstats_df.to_csv(os.path.join(RAW_DIR, "raw_hitter_xstats.csv"), index=False)
-                print(f"  ✓ Merged {CURRENT_YEAR} xstats into raw_hitter_xstats.csv")
-        except Exception as e:
-            print(f"  WARNING: Could not pull {CURRENT_YEAR} hitter xstats — {e}")
-
-        try:
-            cur_fg_pit = pull_fg_pitcher_stats([CURRENT_YEAR])
-            if not cur_fg_pit.empty:
-                fg_pitcher_df = pd.concat(
-                    [fg_pitcher_df[fg_pitcher_df["Season"] != CURRENT_YEAR], cur_fg_pit],
-                    ignore_index=True,
-                )
-                fg_pitcher_df.to_csv(os.path.join(RAW_DIR, "raw_fg_pitcher_stats.csv"), index=False)
-                print(f"  ✓ Merged {CURRENT_YEAR} FG pitcher stats into raw_fg_pitcher_stats.csv")
-        except Exception as e:
-            print(f"  WARNING: Could not pull {CURRENT_YEAR} FG pitcher stats — {e}")
-
-    print(f"\n  TIP: Re-run this file weekly during the {CURRENT_YEAR} season to refresh live stats.")
+    print("\n[ 7/7 ] Pitcher expected stats (xwOBA against, barrel%, HH%)...")
+    pull_pitcher_expected_stats(STAT_YEARS)
 
     print("\n" + "=" * 70)
     print("STEP 1 COMPLETE — Run 02_build_hitter_tb.py next.")

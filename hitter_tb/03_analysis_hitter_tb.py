@@ -1,57 +1,65 @@
 """
 =============================================================================
-HITTER TOTAL BASES MODEL — FILE 3 OF 4: MODEL TRAINING AND SCORING
+HITTER TOTAL BASES MODEL — FILE 3 OF 4: MODEL TRAINING  (REFACTORED)
 =============================================================================
-Purpose : Train XGBoost regressor to predict hitter total bases per game;
-          score specific player prop bets for upcoming games.
-Input   : ../data/processed/hitter_tb_dataset.csv
-          ../data/processed/pitcher_matchup_lookup.csv
-Output  : ../models/hitter_tb_model.json
-          ../data/processed/hitter_tb_predictions.csv
+Purpose : Train an XGBoost multinomial classifier that outputs a full
+          discrete probability distribution over total-bases outcomes.
 
-Model structure:
-  - PRIMARY MODEL: XGBoost REGRESSOR → predicts E[TB] (continuous)
-    This gives us expected total bases (e.g., 1.23 expected TB).
-    We compare this to the market line (e.g., 1.5 over/under).
+Output per batter-game:
+  p_tb_0    P(total bases = 0)
+  p_tb_1    P(total bases = 1)
+  p_tb_2    P(total bases = 2)
+  p_tb_3    P(total bases = 3)
+  p_tb_4p   P(total bases ≥ 4)
 
-  - SECONDARY PROBABILITY: We convert E[TB] to P(over/under line) using
-    a negative binomial distribution (more appropriate than Poisson for
-    count data with overdispersion — TB can be 0,1,2,3,4 per game).
+  Derived from the probability vector:
+  p_over_0_5  = 1 - p_tb_0
+  p_over_1_5  = 1 - p_tb_0 - p_tb_1
+  p_over_2_5  = p_tb_3 + p_tb_4p
+  p_over_3_5  = p_tb_4p
 
-Why XGBoost over Poisson regression here?
-  - TB has more features and non-linear interactions (Barrel% × park factor)
-  - XGBoost handles these non-linearities better than a GLM
-  - We have enough data (hundreds of player-seasons) to benefit from boosting
+PA-volume weighting:
+  Each batter's game-level probability vector P(TB=k | 1 PA) is convolved
+  over their projected plate-appearance volume (pa_proj from batting slot)
+  using a Monte Carlo simulation.  This correctly handles the fact that a
+  leadoff hitter seeing 4.3 PA has more total-bases opportunities than a
+  #9 hitter seeing 3.9 PA.
 
-Daily workflow:
-  1. Pull today's confirmed lineups
-  2. For each player, look up their current Barrel%, EV, etc.
-  3. Look up today's opposing SP stats (K%, SIERA, handedness)
-  4. Run through model → get E[TB]
-  5. Compare to market prop line → calculate edge
+Model: XGBoost multi:softprob
+  - num_class = 5  (classes 0, 1, 2, 3, 4+)
+  - Objective: multi:softprob  → raw output = n_samples × 5 probability matrix
+  - Walk-forward CV (train < year N, test = year N)
+  - Class weights computed per fold to correct class imbalance
+    (TB=0 ~40%, TB=1 ~30%, TB=2 ~18%, TB=3 ~8%, TB=4+ ~4%)
+  - Evaluation: multi-class log loss, accuracy, and calibration per class
 
-For R users:
-  - XGBRegressor uses the same API as XGBClassifier but predicts continuous values
-  - objective="reg:squarederror" = minimizing MSE (like OLS regression)
-  - The predict() output is E[TB] directly (no need for predict_proba())
+MC PA convolution:
+  For a batter with pa_proj = 4.1 and per-PA probabilities p = [p0,p1,p2,p3,p4+]:
+    1. Draw n_sim Poisson(4.1) samples → integer PA counts per simulation
+    2. For each draw of k PA, sample k outcomes i.i.d. from p
+    3. Sum bases (0×n0 + 1×n1 + 2×n2 + 3×n3 + 4×n4+) → game TB distribution
+    4. Compute P(game_TB = 0), P(=1), ... from simulation histogram
+
+Input  : data/processed/hitter_tb_dataset.csv
+Output : models/hitter_tb_model.json
+         models/hitter_tb_features.json
+         models/hitter_tb_metrics.json
+         models/hitter_tb_feature_importance.csv
 =============================================================================
 """
 
 import os
 import json
 import warnings
-import pandas as pd
 import numpy as np
-import joblib
+import pandas as pd
 import xgboost as xgb
 
-from sklearn.model_selection import cross_val_score, KFold
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-from scipy import stats
+from sklearn.metrics import log_loss, accuracy_score
+from sklearn.utils.class_weight import compute_sample_weight
 
 warnings.filterwarnings("ignore")
 
-# --- Configuration ----------------------------------------------------------
 BASE_DIR   = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PROC_DIR   = os.path.join(BASE_DIR, "data", "processed")
 MODEL_DIR  = os.path.join(BASE_DIR, "models")
@@ -60,399 +68,395 @@ EXPORT_DIR = os.path.join(BASE_DIR, "exports")
 os.makedirs(MODEL_DIR,  exist_ok=True)
 os.makedirs(EXPORT_DIR, exist_ok=True)
 
-# Typical prop betting lines for hitter TB
-TB_PROP_LINES = [0.5, 1.5, 2.5]
+N_CLASSES  = 5          # TB = 0, 1, 2, 3, 4+
+N_SIM      = 100_000    # MC simulations for PA convolution
+RNG        = np.random.default_rng(42)
+
+# Batting slot → projected PA (from 02_build)
+SLOT_PA_PROJ = {
+    1: 4.33, 2: 4.27, 3: 4.22, 4: 4.17,
+    5: 4.10, 6: 4.05, 7: 4.00, 8: 3.95, 9: 3.90,
+}
+DEFAULT_PA_PROJ = 4.10
 
 
 # =============================================================================
-# FUNCTION 1: Load and Prepare Data
+# LOAD DATA
 # =============================================================================
 def load_data(path: str) -> tuple:
-    """
-    Load the hitter TB dataset and prepare for XGBoost regression.
+    df = pd.read_csv(path, low_memory=False)
+    print(f"  {len(df):,} batter-games loaded across seasons: "
+          f"{sorted(df['season'].unique())}")
+    print(f"  TB class distribution:\n{df['tb_actual'].value_counts().sort_index()}")
 
-    Primary target: tb_per_game (continuous, expected TB per game)
-    Feature set: Statcast metrics + traditional stats + matchup context
+    exclude = {"game_date", "season", "team", "batter_mlbam", "batter_retro",
+               "team_retro", "sp_mlbam", "sp_retro", "sp_hand", "home_flag",
+               "tb_actual", "feature_season"}
+    feature_cols = [
+        c for c in df.columns
+        if c not in exclude and pd.api.types.is_numeric_dtype(df[c])
+    ]
 
-    Returns
-    -------
-    tuple : (X, y, df, feature_cols)
-    """
-    print(f"  Loading data from: {path}")
-    df = pd.read_csv(path)
-    print(f"  ✓ {len(df):,} batter-seasons loaded.")
-
-    exclude_cols = {
-        "Name", "Team", "team_std", "Season", "IDfg",
-        "tb_per_game", "total_bases", "over_0_5_tb_rate",
-        "over_1_5_tb_rate", "over_2_5_tb_rate",
-        "name_clean",
-        # Also exclude raw counting stats (already in rate form)
-        "G", "PA", "AB", "H", "1B", "2B", "3B", "HR", "R", "RBI", "BB",
-        "SO", "SB", "CS", "singles", "total_bases"
-    }
-
-    feature_cols = [c for c in df.columns
-                    if c not in exclude_cols
-                    and pd.api.types.is_numeric_dtype(df[c])
-                    and df[c].nunique() > 1]   # Drop constant columns
-
-    y = df["tb_per_game"].copy()
     X = df[feature_cols].copy()
-
-    print(f"  ✓ Features: {len(feature_cols)} columns")
-    print(f"  ✓ Target mean: {y.mean():.3f} TB/game | std: {y.std():.3f}")
-    print(f"  ✓ Sample features: {feature_cols[:5]}")
-
+    y = df["tb_actual"].astype(int).copy()
     return X, y, df, feature_cols
 
 
 # =============================================================================
-# FUNCTION 2: Train XGBoost Regressor
+# TRAIN XGBoost MULTICLASS (internal helper)
 # =============================================================================
-def train_xgboost_regressor(X_train: pd.DataFrame, y_train: pd.Series,
-                             X_test:  pd.DataFrame, y_test:  pd.Series
-                             ) -> xgb.XGBRegressor:
-    """
-    Train XGBoost regression model to predict average TB per game.
+def _train_xgb(X_train: pd.DataFrame, y_train: pd.Series,
+               X_val: pd.DataFrame = None,
+               y_val: pd.Series = None) -> xgb.XGBClassifier:
+    # Class imbalance correction via sample weights
+    sample_weights = compute_sample_weight("balanced", y_train)
 
-    For regression, XGBoost minimizes MSE (mean squared error):
-      L(θ) = Σ (y_i - ŷ_i)² + Ω(θ)
-    where Ω is the regularization term that prevents overfitting.
+    params = {
+        "n_estimators":     500,
+        "max_depth":        4,
+        "learning_rate":    0.03,
+        "subsample":        0.75,
+        "colsample_bytree": 0.75,
+        "min_child_weight": 8,
+        "reg_alpha":        0.5,
+        "reg_lambda":       2.0,
+        "objective":        "multi:softprob",
+        "num_class":        N_CLASSES,
+        "eval_metric":      "mlogloss",
+        "random_state":     42,
+        "tree_method":      "hist",
+        "verbosity":        0,
+    }
+    model = xgb.XGBClassifier(**params)
 
-    Key difference from classifier:
-      - objective = "reg:squarederror" (MSE, not binary cross-entropy)
-      - Output is a continuous value E[TB], not a probability
-      - We don't need predict_proba() — just predict()
-
-    Hyperparameter notes for regression:
-      - max_depth=4 works well for player-level data (simpler interactions)
-      - learning_rate=0.03 with 400 trees is a good starting point
-      - min_child_weight=10 prevents overfitting on small player samples
-
-    R equivalent:
-      library(xgboost)
-      dtrain <- xgb.DMatrix(data=as.matrix(X_train), label=y_train)
-      model  <- xgboost(dtrain, nrounds=400, objective="reg:squarederror",
-                         eta=0.03, max_depth=4)
-
-    Returns
-    -------
-    xgb.XGBRegressor
-        Trained regressor model.
-    """
-    print("  Training XGBoost regressor for hitter total bases...")
-
-    model = xgb.XGBRegressor(
-        n_estimators     = 400,
-        max_depth        = 4,
-        learning_rate    = 0.03,
-        subsample        = 0.8,
-        colsample_bytree = 0.7,
-        min_child_weight = 10,   # Min samples per leaf (prevents overfit)
-        reg_alpha        = 0.1,
-        reg_lambda       = 1.0,
-        objective        = "reg:squarederror",
-        random_state     = 42,
-        tree_method      = "hist",
-        verbosity        = 0,
-    )
-
-    model.fit(
-        X_train, y_train,
-        eval_set=[(X_test, y_test)],
-        verbose=False
-    )
-
-    print(f"  ✓ XGBoost regressor trained.")
+    if X_val is not None and y_val is not None:
+        model.fit(X_train, y_train,
+                  sample_weight=sample_weights,
+                  eval_set=[(X_val, y_val)],
+                  verbose=False)
+    else:
+        model.fit(X_train, y_train,
+                  sample_weight=sample_weights,
+                  verbose=False)
     return model
 
 
 # =============================================================================
-# FUNCTION 3: Cross-Validation
+# WALK-FORWARD CROSS-VALIDATION
 # =============================================================================
-def cross_validate_model(model_params: dict, X: pd.DataFrame, y: pd.Series,
-                          n_folds: int = 5) -> dict:
-    """
-    Perform k-fold cross-validation for the TB regression model.
+def walk_forward_cv(df: pd.DataFrame, X: pd.DataFrame,
+                    y: pd.Series, feature_cols: list) -> list:
+    seasons = sorted(df["season"].unique())
+    if len(seasons) < 2:
+        print("  Need at least 2 seasons for walk-forward CV.")
+        return []
 
-    We use a simple KFold here (not time-based) because player-season
-    data doesn't have a strict temporal ordering at the row level.
-    Each row is a player-season summary, not a specific game event.
+    fold_metrics = []
+    for i in range(1, len(seasons)):
+        test_season = seasons[i]
+        train_mask  = df["season"] < test_season
+        test_mask   = df["season"] == test_season
 
-    Metrics for regression:
-      - MAE  : Mean Absolute Error — how many TB off on average
-                (MAE of 0.15 TB is realistic for a good model)
-      - RMSE : Root Mean Squared Error — penalizes big misses more
-      - R²   : Variance explained — how much better than predicting the mean
-                (R² of 0.4–0.6 is strong for player-level prediction)
+        X_train, y_train = X[train_mask], y[train_mask]
+        X_test,  y_test  = X[test_mask],  y[test_mask]
 
-    Returns
-    -------
-    dict with cv_mae, cv_rmse, cv_r2
-    """
-    print(f"  Running {n_folds}-fold cross-validation...")
+        if len(X_train) < 200 or len(X_test) < 50:
+            continue
 
-    kf = KFold(n_splits=n_folds, shuffle=True, random_state=42)
-    cv_model = xgb.XGBRegressor(**model_params, verbosity=0)
+        model  = _train_xgb(X_train, y_train, X_test, y_test)
+        y_prob = model.predict_proba(X_test)   # shape (n, 5)
+        y_pred = y_prob.argmax(axis=1)
 
-    # cross_val_score uses negative metrics so we negate for readable values
-    # In R: cv_results <- trainControl(method="cv", number=5); train(...)
-    mae_scores  = -cross_val_score(cv_model, X, y, cv=kf, scoring="neg_mean_absolute_error")
-    rmse_scores = np.sqrt(-cross_val_score(cv_model, X, y, cv=kf, scoring="neg_mean_squared_error"))
-    r2_scores   = cross_val_score(cv_model, X, y, cv=kf, scoring="r2")
+        # Per-class calibration: mean predicted vs actual rate for each class
+        class_cal = {}
+        for k in range(N_CLASSES):
+            actual_rate    = (y_test == k).mean()
+            predicted_rate = y_prob[:, k].mean()
+            class_cal[f"class_{k}_actual"]    = round(actual_rate,    4)
+            class_cal[f"class_{k}_predicted"] = round(predicted_rate, 4)
 
-    cv_metrics = {
-        "cv_mae":  float(mae_scores.mean()),
-        "cv_rmse": float(rmse_scores.mean()),
-        "cv_r2":   float(r2_scores.mean()),
-    }
-    print(f"  ── Cross-Validation Results ─────────────────────────────────")
-    print(f"  MAE  : {cv_metrics['cv_mae']:.4f} TB (avg error per player)")
-    print(f"  RMSE : {cv_metrics['cv_rmse']:.4f} TB")
-    print(f"  R²   : {cv_metrics['cv_r2']:.4f} (variance explained; 1.0 = perfect)")
-    print(f"  ─────────────────────────────────────────────────────────────")
+        m = {
+            "fold":      f"train<{test_season} / test={test_season}",
+            "n_train":   len(y_train),
+            "n_test":    len(y_test),
+            "log_loss":  round(log_loss(y_test, y_prob, labels=list(range(N_CLASSES))), 4),
+            "accuracy":  round(accuracy_score(y_test, y_pred), 4),
+            **class_cal,
+        }
+        fold_metrics.append(m)
 
-    return cv_metrics
+        print(f"\n  Fold: {m['fold']}")
+        print(f"    Train {m['n_train']:,}  |  Test {m['n_test']:,}")
+        print(f"    Log Loss : {m['log_loss']:.4f}  (5-class random ≈ {np.log(N_CLASSES):.3f})")
+        print(f"    Accuracy : {m['accuracy']:.4f}")
+        print(f"    Class calibration (actual → predicted):")
+        for k in range(N_CLASSES):
+            label = f"TB={k}" if k < 4 else "TB=4+"
+            act   = m[f"class_{k}_actual"]
+            pred  = m[f"class_{k}_predicted"]
+            print(f"      {label}:  {act:.3f} → {pred:.3f}")
+
+    return fold_metrics
 
 
 # =============================================================================
-# FUNCTION 4: Convert E[TB] to P(Over/Under Line)
+# TRAIN FINAL MODEL
 # =============================================================================
-def etb_to_probability(expected_tb: float, line: float,
-                        dispersion: float = 0.8) -> dict:
+def train_final_model(X: pd.DataFrame, y: pd.Series) -> xgb.XGBClassifier:
+    print(f"\n  Training final XGBoost on all {len(X):,} batter-games...")
+    model = _train_xgb(X, y)
+    print("  ✓ Final model trained.")
+    return model
+
+
+# =============================================================================
+# MC PA CONVOLUTION — game-level TB distribution
+# =============================================================================
+def pa_convolution(per_pa_probs: np.ndarray, pa_proj: float,
+                   n_sim: int = N_SIM) -> dict:
     """
-    Convert expected TB (continuous) to P(over/under line).
+    Given:
+      per_pa_probs : array shape (5,) — P(TB=k | single PA) for k in 0..4+
+      pa_proj      : expected number of PA (float, e.g. 4.27 for slot-2)
 
-    We model TB per game as a Negative Binomial distribution:
-      - More appropriate than Poisson because TB is overdispersed
-        (variance > mean, especially for power hitters who have feast/famine games)
-      - Parameters: μ = E[TB], θ = dispersion parameter
+    Returns a dict with:
+      p_tb_0 .. p_tb_4p      — P(game TB = k)
+      p_over_0_5 .. p_over_3_5 — derived O/U probabilities
+      exp_tb                 — E[game TB]
 
-    The dispersion parameter (θ) is estimated from training data.
-    θ = 0.8 is a reasonable default for hitter TB data.
-
-    P(over line) = P(TB >= ceil(line)) if line is not a whole number
-                 = 1 - P(TB ≤ floor(line) - 1) + P(push) for whole numbers
-
-    Alternative: Use a simpler normal approximation when E[TB] is moderate:
-      P(over line) ≈ 1 - Φ((line - E[TB]) / σ)  where σ = std of TB per game
-
-    We use the normal approximation here for simplicity:
-
-    Parameters
-    ----------
-    expected_tb : float
-        Model prediction E[TB] for this player in this game.
-    line : float
-        The market prop line (e.g., 1.5).
-    dispersion : float
-        Standard deviation divisor for the normal approximation.
-        Typical TB std ≈ 1.0–1.2 per game for regular starters.
-
-    Returns
-    -------
-    dict with p_over, p_under, expected_tb
+    Method:
+      1. Draw PA counts from Poisson(pa_proj) for each simulation
+      2. For each simulation, draw n_pa outcomes i.i.d. from per_pa_probs
+      3. Compute game TB = sum of bases (1B→1, 2B→2, 3B→3, HR→4)
+      4. Histogram over N_SIM draws
     """
-    # Empirical standard deviation of TB per game ≈ 1.1
-    # (this could be refined by computing from training data)
-    sigma = max(np.sqrt(expected_tb * dispersion), 0.5)
+    per_pa_probs = np.asarray(per_pa_probs, dtype=float)
+    per_pa_probs = np.clip(per_pa_probs, 0, None)
+    per_pa_probs /= per_pa_probs.sum()  # re-normalise for safety
 
-    # Normal approximation: P(TB > line) = 1 - Φ((line - μ) / σ)
-    # In R: 1 - pnorm(line, mean=expected_tb, sd=sigma)
-    z_score = (line - expected_tb) / sigma
-    p_over  = 1 - stats.norm.cdf(z_score)   # P(TB > line)
-    p_under = stats.norm.cdf(z_score)        # P(TB < line)
+    # PA counts per simulation ~ Poisson(pa_proj)
+    pa_counts = RNG.poisson(pa_proj, size=n_sim)
 
-    # Continuity correction for discrete distributions
-    # (approximates that TB is actually discrete 0,1,2,3,4)
-    if abs(line - round(line)) < 0.1:  # If line is near a whole number (push possible)
-        p_push  = stats.norm.pdf(z_score) / sigma
-        p_over  = max(0, p_over - p_push / 2)
-        p_under = max(0, p_under - p_push / 2)
+    # Bases produced per PA: 0, 1, 2, 3, 4 (4+ capped at 4 for expected value)
+    bases_per_outcome = np.array([0, 1, 2, 3, 4], dtype=float)
+
+    # Vectorised simulation:
+    # Build a lookup of game-TB for each (sim, pa_count) combination
+    # For each unique pa_count, sample that many outcomes from per_pa_probs
+    game_tb = np.zeros(n_sim, dtype=float)
+    for k in np.unique(pa_counts):
+        if k == 0:
+            continue
+        mask = pa_counts == k
+        n_at_k = mask.sum()
+        # shape (n_at_k, k) — each row is one sim with k PA
+        outcomes = RNG.choice(
+            a=len(per_pa_probs),
+            size=(n_at_k, k),
+            p=per_pa_probs
+        )
+        game_tb[mask] = bases_per_outcome[outcomes].sum(axis=1)
+
+    # Histogram
+    bins = np.arange(0, game_tb.max() + 2)
+    hist, _ = np.histogram(game_tb, bins=bins - 0.5)
+    p_vec = hist / hist.sum()
+
+    # Collapse to at most 5 classes (0, 1, 2, 3, 4+)
+    p = np.zeros(5)
+    for i, prob in enumerate(p_vec):
+        cls = min(i, 4)
+        p[cls] += prob
 
     return {
-        "p_over":       round(float(p_over),  4),
-        "p_under":      round(float(p_under), 4),
-        "expected_tb":  round(float(expected_tb), 3),
+        "p_tb_0":     float(p[0]),
+        "p_tb_1":     float(p[1]),
+        "p_tb_2":     float(p[2]),
+        "p_tb_3":     float(p[3]),
+        "p_tb_4p":    float(p[4]),
+        "p_over_0_5": float(1.0 - p[0]),
+        "p_over_1_5": float(1.0 - p[0] - p[1]),
+        "p_over_2_5": float(p[3] + p[4]),
+        "p_over_3_5": float(p[4]),
+        "exp_tb":     float(np.dot(np.arange(5), p)),
     }
 
 
 # =============================================================================
-# FUNCTION 5: Score Individual Players for Upcoming Games
+# SCORE DATASET  (attach game-level probabilities to each batter row)
 # =============================================================================
-def score_player_props(model: xgb.XGBRegressor,
-                        feature_cols: list,
-                        players_df: pd.DataFrame,
-                        prop_line: float = 1.5) -> pd.DataFrame:
+def score_dataset(model: xgb.XGBClassifier,
+                  X: pd.DataFrame,
+                  df: pd.DataFrame,
+                  feature_cols: list) -> pd.DataFrame:
     """
-    Score individual player prop bets for today's games.
-
-    inputs_df should have columns:
-      - player_name  : Player name for identification
-      - team         : Player's team abbreviation
-      - opp_team     : Opposing team
-      - opp_sp_name  : Opposing SP name (for matchup lookup)
-      - All feature columns that the model was trained on
-
-    For platoon adjustments, set 'platoon_advantage' column:
-      - 1 if batter has platoon advantage (LHH vs RHP or RHH vs LHP)
-      - 0 if no advantage (same-hand matchup)
-      - -1 if reverse platoon (rare but relevant for extreme platoon hitters)
-
-    Returns
-    -------
-    pd.DataFrame
-        Player props with expected TB and P(over/under) for each line.
+    Compute per-PA probabilities from the model, then run PA convolution
+    for each row to produce game-level probability vectors.
     """
-    # Ensure all feature columns are present
-    missing = [c for c in feature_cols if c not in players_df.columns]
-    if missing:
-        print(f"  WARNING: Missing features {missing[:5]}... filling with 0")
-        for col in missing:
-            players_df[col] = 0.0
+    print("\n  Scoring dataset with PA convolution...")
+    per_pa_probs = model.predict_proba(X[feature_cols])  # (n, 5)
 
-    X_score = players_df[feature_cols].fillna(0)
+    result_rows = []
+    for i, (_, row) in enumerate(df.iterrows()):
+        pa_proj = row.get("pa_proj", DEFAULT_PA_PROJ)
+        if pd.isna(pa_proj):
+            pa_proj = DEFAULT_PA_PROJ
 
-    # Predict expected total bases per game
-    expected_tb = model.predict(X_score)
-    players_df["expected_tb"] = expected_tb.round(3)
+        game_probs = pa_convolution(per_pa_probs[i], float(pa_proj))
+        result_rows.append({
+            "game_date":    row.get("game_date"),
+            "season":       row.get("season"),
+            "team":         row.get("team"),
+            "batter_mlbam": row.get("batter_mlbam"),
+            "batting_slot": row.get("batting_slot"),
+            "pa_proj":      pa_proj,
+            "tb_actual":    row.get("tb_actual"),
+            **game_probs,
+        })
 
-    # Convert to P(over/under) for each standard prop line
-    # In R: mapply(function(etb) etb_to_probability(etb, line), expected_tb)
-    for line in TB_PROP_LINES:
-        probs_list = [etb_to_probability(etb, line) for etb in expected_tb]
-
-        col_name = f"line_{str(line).replace('.', '_')}"
-        players_df[f"p_over_{col_name}"]  = [p["p_over"]  for p in probs_list]
-        players_df[f"p_under_{col_name}"] = [p["p_under"] for p in probs_list]
-
-    # Primary line for edge calculations (most common prop line is 1.5)
-    main_probs = [etb_to_probability(etb, prop_line) for etb in expected_tb]
-    players_df["p_over_main"]  = [p["p_over"]  for p in main_probs]
-    players_df["p_under_main"] = [p["p_under"] for p in main_probs]
-
-    return players_df
+    scored = pd.DataFrame(result_rows)
+    print(f"  ✓ {len(scored):,} rows scored")
+    return scored
 
 
 # =============================================================================
-# FUNCTION 6: Feature Importance Analysis
+# FEATURE IMPORTANCE
 # =============================================================================
-def analyze_feature_importance(model: xgb.XGBRegressor,
-                                feature_cols: list) -> pd.DataFrame:
-    """
-    Show which Statcast/traditional features drive the XGBoost TB predictions.
-
-    Expected top features for hitter TB:
-      1. barrel_pct / brl_percent    — best single predictor of XBH + HR
-      2. ISO / SLG                   — direct power metrics
-      3. avg_exit_velo               — hard contact = more extra base hits
-      4. hr_per_game                 — direct component of TB
-      5. wRC+ / wOBA                 — overall hitting quality
-
-    If opp_avg_sp_siera is in the top 5, the matchup features are working.
-    """
-    importances = model.feature_importances_
-    imp_df = pd.DataFrame({
+def feature_importance_report(model: xgb.XGBClassifier,
+                               feature_cols: list) -> pd.DataFrame:
+    imp = pd.DataFrame({
         "feature":    feature_cols,
-        "importance": importances,
-    }).sort_values("importance", ascending=False).reset_index(drop=True)
+        "importance": model.feature_importances_,
+    }).sort_values("importance", ascending=False)
 
-    print("\n  ── Feature Importances (Top 15) ─────────────────────────────")
-    for i, row in imp_df.head(15).iterrows():
-        bar = "█" * int(row["importance"] * 300)
-        print(f"  {i+1:2d}. {row['feature']:35s} | {row['importance']:.4f} | {bar}")
-    print("  ─────────────────────────────────────────────────────────────")
-
-    return imp_df
+    print("\n  ── Top 15 Feature Importances ─────────────────────────────────")
+    for _, row in imp.head(15).iterrows():
+        bar = "█" * max(1, int(row["importance"] * 300))
+        print(f"  {row['feature']:40s} | {row['importance']:.4f} | {bar}")
+    print("  ────────────────────────────────────────────────────────────────")
+    return imp
 
 
 # =============================================================================
-# MAIN EXECUTION
+# MAIN
 # =============================================================================
 if __name__ == "__main__":
     print("=" * 70)
-    print("HITTER TOTAL BASES MODEL — STEP 3: MODEL TRAINING AND SCORING")
+    print("HITTER TB MODEL — STEP 3: MODEL TRAINING (REFACTORED)")
     print("=" * 70)
 
     data_path = os.path.join(PROC_DIR, "hitter_tb_dataset.csv")
     if not os.path.exists(data_path):
-        print(f"ERROR: {data_path} not found. Run 02_build_hitter_tb.py first.")
+        print(f"ERROR: {data_path} not found.  Run 02_build_hitter_tb.py first.")
         exit(1)
 
-    print("\n[ 1/6 ] Loading data...")
+    # Load
+    print("\n[ 1/5 ] Loading dataset...")
     X, y, df, feature_cols = load_data(data_path)
+    print(f"  Feature count: {len(feature_cols)}")
+    print(f"  Features: {feature_cols}")
 
-    # Time-based split
-    print("\n[ 2/6 ] Splitting by season...")
-    if "Season" in df.columns:
-        train_mask = df["Season"] < 2025
-        test_mask  = df["Season"] == 2025
-        X_train, X_test = X[train_mask], X[test_mask]
-        y_train, y_test = y[train_mask], y[test_mask]
-    else:
-        from sklearn.model_selection import train_test_split
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-    print(f"  Training: {len(X_train):,} | Test: {len(X_test):,} batter-seasons")
+    # Walk-forward CV
+    print("\n[ 2/5 ] Walk-forward cross-validation...")
+    cv_results = walk_forward_cv(df, X, y, feature_cols)
 
-    # Cross-validation
-    print("\n[ 3/6 ] Cross-validating...")
-    xgb_params = {
-        "n_estimators": 400, "max_depth": 4, "learning_rate": 0.03,
-        "subsample": 0.8, "colsample_bytree": 0.7, "min_child_weight": 10,
-        "reg_alpha": 0.1, "reg_lambda": 1.0, "random_state": 42,
-        "tree_method": "hist"
-    }
-    cv_metrics = cross_validate_model(xgb_params, X_train, y_train, n_folds=5)
+    if cv_results:
+        avg_ll  = np.mean([m["log_loss"]  for m in cv_results])
+        avg_acc = np.mean([m["accuracy"]  for m in cv_results])
+        print(f"\n  ── Walk-Forward CV Summary ──")
+        print(f"  Avg Log Loss : {avg_ll:.4f}  (5-class random = {np.log(N_CLASSES):.3f})")
+        print(f"  Avg Accuracy : {avg_acc:.4f}")
 
     # Train final model
-    print("\n[ 4/6 ] Training final XGBoost model...")
-    model = train_xgboost_regressor(X_train, y_train, X_test, y_test)
+    print("\n[ 3/5 ] Training final model (all seasons)...")
+    final_model = train_final_model(X, y)
 
-    # Evaluate on test set
-    test_preds = model.predict(X_test)
-    test_mae   = mean_absolute_error(y_test, test_preds)
-    test_rmse  = np.sqrt(mean_squared_error(y_test, test_preds))
-    test_r2    = r2_score(y_test, test_preds)
-    print(f"\n  ── Test Set (2024) ────────────────────────────────────────")
-    print(f"  MAE  : {test_mae:.4f} TB | RMSE: {test_rmse:.4f} TB | R²: {test_r2:.4f}")
-    print(f"  ─────────────────────────────────────────────────────────────")
+    # Score with PA convolution + evaluate on most-recent season
+    print("\n[ 4/5 ] PA convolution scoring + evaluation on most-recent season...")
+    scored = score_dataset(final_model, X, df, feature_cols)
+
+    last_season  = sorted(df["season"].unique())[-1]
+    scored_last  = scored[scored["season"] == last_season].copy()
+    labeled_last = scored_last.dropna(subset=["tb_actual"])
+
+    if len(labeled_last) > 0:
+        y_true_last = labeled_last["tb_actual"].astype(int).values
+        per_pa_last = final_model.predict_proba(
+            X[df["season"] == last_season][feature_cols]
+        )
+        ll_last  = log_loss(y_true_last, per_pa_last,
+                            labels=list(range(N_CLASSES)))
+        acc_last = accuracy_score(y_true_last, per_pa_last.argmax(axis=1))
+
+        print(f"\n  Final model — season {last_season} ({len(labeled_last):,} games):")
+        print(f"    Log Loss : {ll_last:.4f}")
+        print(f"    Accuracy : {acc_last:.4f}")
+
+        # O/U calibration on scored data
+        print(f"\n    O/U line calibration (mean model P vs actual rate):")
+        for line_col, desc in [("p_over_0_5", "Over 0.5 TB"),
+                                ("p_over_1_5", "Over 1.5 TB"),
+                                ("p_over_2_5", "Over 2.5 TB"),
+                                ("p_over_3_5", "Over 3.5 TB")]:
+            threshold = float(line_col.split("_")[2]) / 10.0
+            actual_rate = (labeled_last["tb_actual"] > threshold + 0.5 - 1).mean()
+            pred_rate   = labeled_last[line_col].mean()
+            # Recalculate actual over rate from raw tb_actual
+            if "0.5" in line_col:
+                actual_rate = (labeled_last["tb_actual"] > 0).mean()
+            elif "1.5" in line_col:
+                actual_rate = (labeled_last["tb_actual"] > 1).mean()
+            elif "2.5" in line_col:
+                actual_rate = (labeled_last["tb_actual"] > 2).mean()
+            elif "3.5" in line_col:
+                actual_rate = (labeled_last["tb_actual"] > 3).mean()
+            print(f"    {desc}: model={pred_rate:.3f}  actual={actual_rate:.3f}  "
+                  f"diff={pred_rate - actual_rate:+.3f}")
+
+        final_metrics = {
+            "log_loss_last_season":  round(ll_last, 4),
+            "accuracy_last_season":  round(acc_last, 4),
+            "n_test":                int(len(labeled_last)),
+            "test_season":           int(last_season),
+            "n_features":            len(feature_cols),
+            "n_classes":             N_CLASSES,
+            "cv_folds":              cv_results,
+        }
+    else:
+        final_metrics = {
+            "n_features":  len(feature_cols),
+            "n_classes":   N_CLASSES,
+            "cv_folds":    cv_results,
+        }
 
     # Feature importance
-    print("\n[ 5/6 ] Analyzing feature importances...")
-    imp_df = analyze_feature_importance(model, feature_cols)
+    print("\n[ 5/5 ] Feature importances + saving artifacts...")
+    imp_df = feature_importance_report(final_model, feature_cols)
 
-    # Save model
-    print("\n[ 6/6 ] Saving model and building scoring template...")
-    model.save_model(os.path.join(MODEL_DIR, "hitter_tb_model.json"))
-    with open(os.path.join(MODEL_DIR, "hitter_tb_features.json"), "w") as f:
+    # ── Save artifacts ─────────────────────────────────────────────────────
+    model_path = os.path.join(MODEL_DIR, "hitter_tb_model.json")
+    final_model.save_model(model_path)
+    print(f"  ✓ XGBoost model         : {model_path}")
+
+    feat_path = os.path.join(MODEL_DIR, "hitter_tb_features.json")
+    with open(feat_path, "w") as f:
         json.dump(feature_cols, f)
+    print(f"  ✓ Feature list          : {feat_path}")
 
-    metrics_all = {**cv_metrics, "test_mae": test_mae, "test_rmse": test_rmse, "test_r2": test_r2}
-    with open(os.path.join(MODEL_DIR, "hitter_tb_metrics.json"), "w") as f:
-        json.dump(metrics_all, f, indent=2)
-    imp_df.to_csv(os.path.join(MODEL_DIR, "hitter_tb_feature_importance.csv"), index=False)
+    met_path = os.path.join(MODEL_DIR, "hitter_tb_metrics.json")
+    with open(met_path, "w") as f:
+        json.dump(final_metrics, f, indent=2)
+    print(f"  ✓ Metrics               : {met_path}")
 
-    # Scoring template — build example player slate
-    col_means = X.mean().to_dict()
-    example_players = [
-        {"player_name": "Juan Soto",    "team": "NYM", "opp_team": "ATL", "platoon_advantage": 1, **col_means},
-        {"player_name": "Aaron Judge",  "team": "NYY", "opp_team": "BOS", "platoon_advantage": 0, **col_means},
-        {"player_name": "Freddie Freeman","team": "LAD","opp_team": "SFG","platoon_advantage": 1, **col_means},
-    ]
-    template = pd.DataFrame(example_players)
+    imp_path = os.path.join(MODEL_DIR, "hitter_tb_feature_importance.csv")
+    imp_df.to_csv(imp_path, index=False)
+    print(f"  ✓ Feature importances   : {imp_path}")
 
-    scored = score_player_props(model, feature_cols, template, prop_line=1.5)
-    predictions_path = os.path.join(PROC_DIR, "hitter_tb_predictions.csv")
-    scored.to_csv(predictions_path, index=False)
-    print(f"  ✓ Predictions saved: {predictions_path}")
-
-    display_cols = ["player_name", "team", "opp_team", "expected_tb",
-                    "p_over_line_1_5", "p_under_line_1_5"]
-    display_cols = [c for c in display_cols if c in scored.columns]
-    print(f"\n  Sample predictions (1.5 TB prop line):")
-    print(scored[display_cols].to_string(index=False))
+    # Save scored training data for inspection
+    scored_path = os.path.join(PROC_DIR, "hitter_tb_scored_train.csv")
+    scored.to_csv(scored_path, index=False)
+    print(f"  ✓ Scored training data  : {scored_path}")
 
     print("\n" + "=" * 70)
-    print("STEP 3 COMPLETE — Run 04_export_hitter_tb.py next.")
+    print("STEP 3 COMPLETE — Run 04_export_hitter_tb.py for today's picks.")
     print("=" * 70)

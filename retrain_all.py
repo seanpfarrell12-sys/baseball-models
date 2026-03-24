@@ -42,18 +42,21 @@ PIPELINE = [
         ("Totals",       "totals/01_input_totals.py"),
         ("Hitter TB",    "hitter_tb/01_input_hitter_tb.py"),
         ("Pitcher Outs", "pitcher_outs/01_input_pitcher_outs.py"),
+        ("NRFI/YRFI",    "nrfi/01_input_nrfi.py"),
     ]),
     ("02 — Rebuild datasets", [
         ("Moneyline",    "moneyline/02_build_moneyline.py"),
         ("Totals",       "totals/02_build_totals.py"),
         ("Hitter TB",    "hitter_tb/02_build_hitter_tb.py"),
         ("Pitcher Outs", "pitcher_outs/02_build_pitcher_outs.py"),
+        ("NRFI/YRFI",    "nrfi/02_build_nrfi.py"),
     ]),
     ("03 — Retrain models", [
         ("Moneyline",    "moneyline/03_analysis_moneyline.py"),
         ("Totals",       "totals/03_analysis_totals.py"),
         ("Hitter TB",    "hitter_tb/03_analysis_hitter_tb.py"),
         ("Pitcher Outs", "pitcher_outs/03_analysis_pitcher_outs.py"),
+        ("NRFI/YRFI",    "nrfi/03_analysis_nrfi.py"),
     ]),
 ]
 
@@ -86,5 +89,5 @@ if __name__ == "__main__":
         for e in errors:
             print(f"    ✗ {e}")
     else:
-        print("  All 12 steps completed successfully.")
+        print("  All 15 steps completed successfully.")
     print(f"{'=' * 70}\n")
