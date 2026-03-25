@@ -297,6 +297,15 @@ def build_tb_edge_report(predictions_df: pd.DataFrame,
     report_df = pd.DataFrame(rows)
     if not report_df.empty:
         report_df = report_df.sort_values("edge_score", ascending=False).reset_index(drop=True)
+        # Keep only the single best-scoring value bet per player (max 1 pick per batter)
+        best_idx = (
+            report_df[report_df["is_value_bet"] == 1]
+            .groupby("player_name")["edge_score"]
+            .idxmax()
+        )
+        report_df["is_value_bet"] = 0
+        if not best_idx.empty:
+            report_df.loc[best_idx.values, "is_value_bet"] = 1
     return report_df
 
 
