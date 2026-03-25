@@ -716,6 +716,12 @@ def run_nrfi_export(target_date: str = None, verbose: bool = True) -> pd.DataFra
             print(f"  Skipping {away_team}@{home_team} — lineup not confirmed yet.")
             continue
 
+        # Skip games where either starting pitcher is not individually confirmed
+        if matchup.get("home_sp_source") == "team_avg" or \
+           matchup.get("away_sp_source") == "team_avg":
+            print(f"  Skipping {away_team}@{home_team} — starting pitcher(s) not confirmed yet.")
+            continue
+
         # Top-3 lineup slots (from confirmed lineups only)
         def _top3(team_key):
             team_lu = lineups.get(team_key, [])

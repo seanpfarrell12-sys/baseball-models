@@ -338,6 +338,14 @@ def score_live_games_totals(odds_df: pd.DataFrame) -> pd.DataFrame:
             continue
 
         sp_row = sp_lookup.get((home, away), None)
+
+        # Skip games where either starting pitcher is not individually confirmed
+        if sp_row is None or \
+           sp_row.get("home_sp_source") == "team_avg" or \
+           sp_row.get("away_sp_source") == "team_avg":
+            print(f"  Skipping {away} @ {home} — starting pitcher(s) not confirmed yet.")
+            continue
+
         if sp_row is not None:
             home_sp_siera = float(sp_row.get("home_sp_siera", np.nan))
             home_sp_k_pct = float(sp_row.get("home_sp_k_pct", np.nan))

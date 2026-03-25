@@ -414,11 +414,19 @@ def score_live_hitters() -> pd.DataFrame:
         return pd.DataFrame()
 
     # Build: team → opposing SP stats (opp_avg_sp_*)
+    # Only include games where BOTH SPs are individually confirmed
     opp_sp_map = {}   # team → {opp_avg_sp_k_pct, ...}
     if not sp_df.empty:
         for _, sp_row in sp_df.iterrows():
             home = sp_row["home_team"]
             away = sp_row["away_team"]
+            if sp_row.get("home_sp_source") == "team_avg" or \
+               sp_row.get("away_sp_source") == "team_avg":
+                print(f"  Skipping {away} @ {home} hitters — starting pitcher(s) not confirmed yet.")
+                # Remove any confirmed lineups for these teams so they aren't scored
+                lineups.pop(home, None)
+                lineups.pop(away, None)
+                continue
             # Home batters face the away SP
             opp_sp_map[home] = {
                 "opp_avg_sp_k_pct":    sp_row.get("away_sp_k_pct",    np.nan),

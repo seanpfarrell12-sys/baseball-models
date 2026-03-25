@@ -465,6 +465,12 @@ def score_live_pitchers() -> pd.DataFrame:
             if not pitcher_name:
                 continue
 
+            # Skip if this pitcher's individual stats are not confirmed
+            sp_source_col = f"{side}_sp_source"
+            if game.get(sp_source_col) == "team_avg":
+                print(f"  Skipping {pitcher_name} ({team}) — starter not individually confirmed.")
+                continue
+
             # Skip if opposing lineup is not yet confirmed
             if lineup_sources.get(opp_team, "projected") != "confirmed":
                 print(f"  Skipping {pitcher_name} ({team}) — {opp_team} lineup not confirmed yet.")

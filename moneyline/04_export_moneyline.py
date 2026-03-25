@@ -573,6 +573,14 @@ def score_live_games(odds_df: pd.DataFrame) -> pd.DataFrame:
         # Prefer individual probable starter stats; fall back to team averages
         _sp = sp_lookup.get((home, away), {})
         sp_row = _sp.to_dict() if isinstance(_sp, pd.Series) else _sp
+
+        # Skip games where either starting pitcher is not individually confirmed
+        if not sp_row or \
+           sp_row.get("home_sp_source") == "team_avg" or \
+           sp_row.get("away_sp_source") == "team_avg":
+            print(f"  Skipping {away} @ {home} — starting pitcher(s) not confirmed yet.")
+            continue
+
         if sp_row:
             h_sp = {k.replace("home_", ""): v for k, v in sp_row.items()
                     if k.startswith("home_sp_")}
