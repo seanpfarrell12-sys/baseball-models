@@ -156,6 +156,7 @@ def _send_discord_embed(title: str, fields: list, footer: str = ""):
     resp = requests.post(url, json={"embeds": [embed]}, timeout=10)
     if resp.status_code not in (200, 204):
         print(f"  (notifier) Discord error {resp.status_code}: {resp.text[:200]}")
+        return
 
 
 # =============================================================================
@@ -254,9 +255,19 @@ def _format_discord(results: dict, pick_date: str) -> tuple:
         if not picks:
             continue
         total += len(picks)
+        # Discord field value limit is 1024 characters
+        lines, remaining = [], len(picks)
+        for p in picks:
+            line = f"`{p}`"
+            candidate = "\n".join(lines + [line])
+            if len(candidate) > 980:
+                lines.append(f"*… +{remaining} more*")
+                break
+            lines.append(line)
+            remaining -= 1
         fields.append({
-            "name":   f"{cfg['emoji']} {model_name}",
-            "value":  "\n".join(f"`{p}`" for p in picks),
+            "name":   f"{cfg['emoji']} {model_name} ({len(picks)})",
+            "value":  "\n".join(lines),
             "inline": False,
         })
 

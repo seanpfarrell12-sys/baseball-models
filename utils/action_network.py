@@ -738,10 +738,11 @@ def get_pitcher_outs_odds(game_date: str = None, token: str = None) -> pd.DataFr
 
 def get_nrfi_odds(game_date: str = None, token: str = None) -> pd.DataFrame:
     """
-    Fetch NRFI/YRFI first-inning total odds from the scoreboard markets field.
+    Fetch NRFI/YRFI first-inning total odds from the AN scoreboard.
 
-    The first-inning total (line=0.5) lives in game.markets[book_id]["firstinning"]["total"]
-    in the standard v1 scoreboard response — not in the props endpoint.
+    Use period=firstinning — the response puts first-inning lines in the
+    game['odds'] list (same structure as game-level odds) with total=0.5.
+    Each entry has a book_id, over (YRFI juice), and under (NRFI juice).
 
     Over 0.5 = YRFI (at least one run scores in the 1st inning)
     Under 0.5 = NRFI (no runs in the 1st inning)
@@ -761,7 +762,7 @@ def get_nrfi_odds(game_date: str = None, token: str = None) -> pd.DataFrame:
     try:
         resp = session.get(
             f"{BASE_URL}/scoreboard/mlb",
-            params={"period": "game", "bookIds": book_ids,
+            params={"period": "firstinning", "bookIds": book_ids,
                     "date": game_date.replace("-", "")},
             timeout=15,
         )
@@ -784,16 +785,18 @@ def get_nrfi_odds(game_date: str = None, token: str = None) -> pd.DataFrame:
         home_abbr = AN_TEAM_MAP.get(home_full, home.get("abbr", ""))
         away_abbr = AN_TEAM_MAP.get(away_full, away.get("abbr", ""))
 
-        # Collect firstinning total odds across all books
+        # Collect first-inning total (0.5) odds across all books
         over_odds  = []
         under_odds = []
-        for book_markets in game.get("markets", {}).values():
-            for entry in book_markets.get("firstinning", {}).get("total", []):
-                side  = str(entry.get("side", "")).lower()
-                odds  = entry.get("odds")
-                value = entry.get("value")
-                if value == 0.5 and odds is not None:
-                    (over_odds if side == "over" else under_odds).append(float(odds))
+        for entry in game.get("odds", []):
+            if entry.get("total") != 0.5:
+                continue
+            ov = entry.get("over")
+            un = entry.get("under")
+            if ov is not None:
+                over_odds.append(float(ov))
+            if un is not None:
+                under_odds.append(float(un))
 
         if not over_odds and not under_odds:
             continue
