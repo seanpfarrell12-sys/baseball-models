@@ -123,6 +123,23 @@ def main():
     windows = group_into_windows(game_times)
     log(f"Found {len(game_times)} game(s) across {len(windows)} time window(s).")
 
+    try:
+        from utils.notifier import notify_run_status
+        run_times = [
+            (window_time - LEAD_TIME).astimezone().strftime("%-I:%M %p %Z")
+            for window_time in windows
+        ]
+        first_pitch_times = [
+            window_time.astimezone().strftime("%-I:%M %p %Z")
+            for window_time in windows
+        ]
+        lines = [f"{len(game_times)} game(s) · {len(windows)} model run(s) scheduled"]
+        for fp, rt in zip(first_pitch_times, run_times):
+            lines.append(f"  First pitch {fp} → models run at {rt}")
+        notify_run_status("✅ 8 AM Schedule Analyzed", lines)
+    except Exception as e:
+        log(f"Status notification failed: {e}")
+
     for i, window_time in enumerate(windows, 1):
         run_at    = window_time - LEAD_TIME
         now_utc   = datetime.now(timezone.utc)

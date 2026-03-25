@@ -34,5 +34,8 @@ if n_graded > 0:
     send_graded_results(yesterday_str)
 else:
     print("  No picks to grade or results not yet final.")
+    from utils.notifier import notify_run_status
+    notify_run_status("📋 9 AM Grader — No Results",
+                      ["No picks from yesterday to grade, or results not yet final."])
 
 print(f"\n{'=' * 60}\n")

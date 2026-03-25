@@ -77,7 +77,7 @@ ODDS_API_KEY      = "fbc985ad430c95d6435cb75210f7b989"
 KELLY_FRACTION    = 0.25    # fractional Kelly for game-level markets
 MAX_BET_FRACTION  = 0.04    # cap per game at 4% of bankroll
 MIN_EDGE          = 0.03    # minimum edge to flag as a pick (3%)
-CURRENT_SEASON    = 2025
+CURRENT_SEASON    = 2026
 
 # Open-Meteo forecast URL
 OPENMETEO_FORECAST_URL = "https://api.open-meteo.com/v1/forecast"

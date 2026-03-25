@@ -100,6 +100,21 @@ def _setup_discord_results():
     print("  ✓ Test sent — check your results channel.\n")
 
 
+def _setup_discord_status():
+    print("\n" + "=" * 60)
+    print("  DISCORD NOTIFIER — SETUP (model-status channel)")
+    print("=" * 60)
+    print("\n  Channel Settings → Integrations → Webhooks → New Webhook → Copy URL\n")
+    url = input("  Paste your model-status channel webhook URL: ").strip()
+    creds = _load_creds()
+    creds["discord_status_webhook"] = url
+    _save_creds(creds)
+    print(f"\n  ✓ Discord status webhook saved.")
+    print("  Sending test message...")
+    _notify_status_raw("🟢 Baseball Models connected — model-status channel setup complete!")
+    print("  ✓ Test sent — check your #model-status channel.\n")
+
+
 # =============================================================================
 # SMS HELPERS
 # =============================================================================
@@ -139,6 +154,14 @@ def _send_discord_raw(content: str):
 def _send_discord_results_raw(content: str):
     creds = _load_creds()
     url   = creds.get("discord_results_webhook")
+    if not url:
+        return
+    requests.post(url, json={"content": content}, timeout=10)
+
+
+def _notify_status_raw(content: str):
+    creds = _load_creds()
+    url   = creds.get("discord_status_webhook")
     if not url:
         return
     requests.post(url, json={"content": content}, timeout=10)
@@ -400,6 +423,29 @@ def _format_discord_results(grade_date: str) -> tuple:
 # PUBLIC API
 # =============================================================================
 
+def notify_run_status(title: str, lines: list, success: bool = True):
+    """
+    Send a brief run-status embed to the Discord #model-status channel.
+    Called by retrain_all.py, schedule_daily.py, grade_daily.py, and
+    run_daily.py to confirm each scheduled job completed (or failed).
+    """
+    creds = _load_creds()
+    url   = creds.get("discord_status_webhook")
+    if not url:
+        return
+    color = 0x2ecc71 if success else 0xe74c3c   # green / red
+    embed = {
+        "title":       title,
+        "description": "\n".join(lines) if lines else "",
+        "color":       color,
+        "footer":      {"text": datetime.now().strftime("%-I:%M %p · %b %-d, %Y")},
+    }
+    try:
+        requests.post(url, json={"embeds": [embed]}, timeout=10)
+    except Exception as e:
+        print(f"  (notifier) Status notification failed: {e}")
+
+
 def send_graded_results(grade_date: str):
     """Send yesterday's graded results to the Discord results channel."""
     creds = _load_creds()
@@ -451,9 +497,11 @@ if __name__ == "__main__":
     ap.add_argument("--setup-sms",             action="store_true", help="Configure SMS (Gmail app password)")
     ap.add_argument("--setup-discord",         action="store_true", help="Configure Discord picks channel webhook")
     ap.add_argument("--setup-discord-results", action="store_true", help="Configure Discord results channel webhook")
+    ap.add_argument("--setup-discord-status",  action="store_true", help="Configure Discord model-status channel webhook")
     ap.add_argument("--test-sms",              action="store_true", help="Send a test SMS")
     ap.add_argument("--test-discord",          action="store_true", help="Send a test Discord picks message")
     ap.add_argument("--test-discord-results",  action="store_true", help="Send a test Discord results message")
+    ap.add_argument("--test-discord-status",   action="store_true", help="Send a test Discord model-status message")
     parsed = ap.parse_args()
 
     if parsed.setup_sms:
@@ -462,6 +510,8 @@ if __name__ == "__main__":
         _setup_discord()
     elif parsed.setup_discord_results:
         _setup_discord_results()
+    elif parsed.setup_discord_status:
+        _setup_discord_status()
     elif parsed.test_sms:
         _send_sms_raw("Test from baseball models — SMS is working!")
         print("Test SMS sent.")
@@ -471,5 +521,8 @@ if __name__ == "__main__":
     elif parsed.test_discord_results:
         _send_discord_results_raw("📊 Test from baseball models — Discord results channel is working!")
         print("Test Discord results message sent.")
+    elif parsed.test_discord_status:
+        notify_run_status("🟢 Model Status Test", ["This is a test — #model-status channel is working!"])
+        print("Test status message sent.")
     else:
         ap.print_help()

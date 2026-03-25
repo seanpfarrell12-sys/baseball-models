@@ -81,7 +81,10 @@ if __name__ == "__main__":
                 traceback.print_exc()
                 errors.append(msg)
 
-    elapsed = (datetime.now() - start).seconds
+    elapsed  = (datetime.now() - start).seconds
+    n_total  = sum(len(scripts) for _, scripts in PIPELINE)
+    n_ok     = n_total - len(errors)
+
     print(f"\n{'=' * 70}")
     print(f"  RETRAIN COMPLETE — {elapsed}s elapsed")
     if errors:
@@ -91,3 +94,17 @@ if __name__ == "__main__":
     else:
         print("  All 15 steps completed successfully.")
     print(f"{'=' * 70}\n")
+
+    try:
+        from utils.notifier import notify_run_status
+        mins, secs = divmod(elapsed, 60)
+        elapsed_str = f"{mins}m {secs}s" if mins else f"{secs}s"
+        if errors:
+            lines = [f"✗ {e}" for e in errors]
+            lines.append(f"\n{n_ok}/{n_total} steps OK · {elapsed_str}")
+            notify_run_status(f"⚠️ 6 AM Retrain — {len(errors)} error(s)", lines, success=False)
+        else:
+            notify_run_status("✅ 6 AM Retrain Complete",
+                              [f"All {n_total} steps OK · {elapsed_str}"])
+    except Exception as e:
+        print(f"  (notifier) Status notification failed: {e}")

@@ -268,6 +268,25 @@ if __name__ == "__main__":
                     writer, sheet_name=sheet, index=False
                 )
 
+    # ── Run-status notification to results channel ────────────────────────
+    try:
+        from utils.notifier import notify_run_status
+        elapsed_for_notif = (datetime.now() - start).seconds
+        mins, secs = divmod(elapsed_for_notif, 60)
+        elapsed_str = f"{mins}m {secs}s" if mins else f"{secs}s"
+        status_lines = []
+        for name, report in results.items():
+            if report is None:
+                status_lines.append(f"⊘ {name}: skipped / no data")
+            else:
+                n = int((report["is_value_bet"] == 1).sum()) \
+                    if "is_value_bet" in report.columns else "?"
+                status_lines.append(f"✓ {name}: {n} value bet(s)")
+        status_lines.append(f"\n⏱ {elapsed_str}")
+        notify_run_status("✅ T-90 Models Complete", status_lines)
+    except Exception as e:
+        print(f"  WARNING: run-status notification failed — {e}")
+
     # ── Final summary ─────────────────────────────────────────────────────
     elapsed = (datetime.now() - start).seconds
     print(f"\n{'=' * 70}")
