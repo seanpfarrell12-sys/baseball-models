@@ -239,7 +239,7 @@ if __name__ == "__main__":
     # ── Save today's picks for future grading ─────────────────────────────
     save_picks(today_str, results)
 
-    # ── Send SMS summary ───────────────────────────────────────────────────
+    # ── Send Discord picks ─────────────────────────────────────────────────
     from utils.notifier import send_daily_picks
     from utils.probable_starters import get_todays_game_status
     scored_games, pending_games = get_todays_game_status()

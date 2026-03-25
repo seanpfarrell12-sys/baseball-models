@@ -1,12 +1,12 @@
 """
 =============================================================================
-NOTIFIER — SMS + Discord daily picks delivery
+NOTIFIER — Discord daily picks delivery
 =============================================================================
 Setup (one-time):
-  python3 utils/notifier.py --setup-sms      # Gmail app password for SMS
-  python3 utils/notifier.py --setup-discord  # Discord webhook URL
+  python3 utils/notifier.py --setup-discord          # picks channel webhook
+  python3 utils/notifier.py --setup-discord-results  # results channel webhook
+  python3 utils/notifier.py --setup-discord-status   # model-status channel webhook
 
-SMS uses Verizon email-to-SMS gateway: 4105625017@vtext.com
 Discord uses a free incoming webhook — no bot account needed.
 
 To get a Discord webhook URL:
@@ -17,10 +17,8 @@ To get a Discord webhook URL:
 """
 
 import json
-import smtplib
 import argparse
 import requests
-from email.mime.text import MIMEText
 from pathlib import Path
 from datetime import datetime
 
@@ -28,9 +26,6 @@ import pandas as pd
 
 BASE_DIR      = Path(__file__).parent.parent
 CREDS_FILE    = Path(__file__).parent / ".notifier_credentials.json"
-
-SMS_TO        = "4105625017@vtext.com"
-MAX_SMS_CHARS = 155
 
 # Discord embed colour (green)
 DISCORD_COLOR = 0x2ecc71
@@ -49,23 +44,6 @@ def _load_creds() -> dict:
 def _save_creds(creds: dict):
     CREDS_FILE.write_text(json.dumps(creds, indent=2))
 
-
-def _setup_sms():
-    print("\n" + "=" * 60)
-    print("  SMS NOTIFIER — SETUP")
-    print("=" * 60)
-    print("\n  You'll need a Gmail App Password (not your regular password).")
-    print("  Get one at: myaccount.google.com/security → App passwords\n")
-    gmail = input("  Your Gmail address: ").strip()
-    pwd   = input("  App password (16 chars, spaces OK): ").replace(" ", "").strip()
-    creds = _load_creds()
-    creds["gmail"]       = gmail
-    creds["app_password"] = pwd
-    _save_creds(creds)
-    print(f"\n  ✓ SMS credentials saved.")
-    print("  Running test message...")
-    _send_sms_raw("Test from baseball models: SMS setup complete!")
-    print("  ✓ Test sent — check your phone.\n")
 
 
 def _setup_discord():
@@ -113,29 +91,6 @@ def _setup_discord_status():
     print("  Sending test message...")
     _notify_status_raw("🟢 Baseball Models connected — model-status channel setup complete!")
     print("  ✓ Test sent — check your #model-status channel.\n")
-
-
-# =============================================================================
-# SMS HELPERS
-# =============================================================================
-
-def _send_sms_raw(body: str):
-    creds = _load_creds()
-    if not creds.get("gmail"):
-        print("  (notifier) SMS not configured — run: python3 utils/notifier.py --setup-sms")
-        return
-    msg            = MIMEText(body)
-    msg["From"]    = creds["gmail"]
-    msg["To"]      = SMS_TO
-    msg["Subject"] = ""
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-        server.login(creds["gmail"], creds["app_password"])
-        server.sendmail(creds["gmail"], SMS_TO, msg.as_string())
-
-
-def _send_sms_messages(parts: list):
-    for part in parts:
-        _send_sms_raw(part)
 
 
 # =============================================================================
@@ -282,54 +237,6 @@ def _pick_rows(report, model_name: str, cfg: dict) -> list:
 
 
 # =============================================================================
-# SMS FORMAT
-# =============================================================================
-
-def _format_sms(results: dict, pick_date: str,
-                scored_games: list = None, pending_games: list = None) -> list:
-    date_fmt = datetime.strptime(pick_date, "%Y%m%d").strftime("%m/%d")
-    lines    = [f"PICKS {date_fmt}"]
-
-    if scored_games:
-        lines.append(f"RUN({len(scored_games)}): {', '.join(scored_games)}")
-    if pending_games:
-        lines.append(f"PENDING({len(pending_games)}): {', '.join(pending_games)}")
-
-    for model_name, cfg in MODEL_CONFIGS.items():
-        picks = _pick_rows(results.get(model_name), model_name, cfg)
-        if not picks:
-            continue
-        lines.append(f"--{cfg['sms_label']}--")
-        for p in picks:
-            # Shorten to last name for SMS
-            parts = p.split()
-            if cfg["subject_col"] and len(parts) > 1:
-                p = " ".join([parts[-1]] + parts[1:]) if len(parts) > 1 else p
-            lines.append(p)
-
-    if len(lines) <= 1:
-        return []
-
-    # Pack into 155-char chunks
-    messages, current = [], ""
-    for line in lines:
-        candidate = (current + "\n" + line).strip()
-        if len(candidate) <= MAX_SMS_CHARS:
-            current = candidate
-        else:
-            if current:
-                messages.append(current)
-            current = line
-    if current:
-        messages.append(current)
-
-    if len(messages) > 1:
-        messages = [f"({i+1}/{len(messages)}) {m}" for i, m in enumerate(messages)]
-
-    return messages
-
-
-# =============================================================================
 # DISCORD FORMAT
 # =============================================================================
 
@@ -464,22 +371,9 @@ def send_graded_results(grade_date: str):
 
 def send_daily_picks(results: dict, pick_date: str,
                      scored_games: list = None, pending_games: list = None):
-    """Send today's value bets via SMS and/or Discord (whichever is configured)."""
+    """Send today's value bets via Discord."""
     creds = _load_creds()
 
-    # SMS
-    if creds.get("gmail"):
-        messages = _format_sms(results, pick_date, scored_games, pending_games)
-        if messages:
-            _send_sms_messages(messages)
-            print(f"  (notifier) SMS sent ({len(messages)} message(s)).")
-        else:
-            _send_sms_raw(f"No value bets {datetime.strptime(pick_date, '%Y%m%d').strftime('%m/%d')}.")
-            print("  (notifier) SMS sent: no value bets today.")
-    else:
-        print("  (notifier) SMS not configured — run: python3 utils/notifier.py --setup-sms")
-
-    # Discord
     if creds.get("discord_webhook"):
         title, fields, footer = _format_discord(results, pick_date)
         _send_discord_embed(title, fields, footer)
@@ -494,27 +388,20 @@ def send_daily_picks(results: dict, pick_date: str,
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--setup-sms",             action="store_true", help="Configure SMS (Gmail app password)")
     ap.add_argument("--setup-discord",         action="store_true", help="Configure Discord picks channel webhook")
     ap.add_argument("--setup-discord-results", action="store_true", help="Configure Discord results channel webhook")
     ap.add_argument("--setup-discord-status",  action="store_true", help="Configure Discord model-status channel webhook")
-    ap.add_argument("--test-sms",              action="store_true", help="Send a test SMS")
     ap.add_argument("--test-discord",          action="store_true", help="Send a test Discord picks message")
     ap.add_argument("--test-discord-results",  action="store_true", help="Send a test Discord results message")
     ap.add_argument("--test-discord-status",   action="store_true", help="Send a test Discord model-status message")
     parsed = ap.parse_args()
 
-    if parsed.setup_sms:
-        _setup_sms()
-    elif parsed.setup_discord:
+    if parsed.setup_discord:
         _setup_discord()
     elif parsed.setup_discord_results:
         _setup_discord_results()
     elif parsed.setup_discord_status:
         _setup_discord_status()
-    elif parsed.test_sms:
-        _send_sms_raw("Test from baseball models — SMS is working!")
-        print("Test SMS sent.")
     elif parsed.test_discord:
         _send_discord_raw("⚾ Test from baseball models — Discord picks channel is working!")
         print("Test Discord message sent.")
