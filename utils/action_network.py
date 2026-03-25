@@ -400,14 +400,23 @@ def _parse_game_odds(game: dict) -> dict:
         if un_odds is not None:
             under_juices.append(float(un_odds))
 
-    # Consensus = median across books (more robust than mean to outliers)
-    # In R: median(x, na.rm=TRUE)
+    # Consensus = median across books, with outlier filtering for totals.
+    # A single book posting a stale/alt-market line (e.g. FanDuel at 8.5 when
+    # everyone else has 7.0) would otherwise skew a small-n median.
+    # We drop any total more than 1.5 runs from the median before finalising.
     def med(lst, default=None):
         return float(np.median(lst)) if lst else default
 
+    def med_filtered(lst, threshold=1.5, default=None):
+        if not lst:
+            return default
+        m = float(np.median(lst))
+        filtered = [x for x in lst if abs(x - m) <= threshold]
+        return float(np.median(filtered)) if filtered else m
+
     consensus_home_ml  = med(home_mls,   default=None)
     consensus_away_ml  = med(away_mls,   default=None)
-    consensus_total    = med(totals,      default=None)
+    consensus_total    = med_filtered(totals, default=None)
     consensus_ov_juice = med(over_juices, default=-110)
     consensus_un_juice = med(under_juices,default=-110)
 
