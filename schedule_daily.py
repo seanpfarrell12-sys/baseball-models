@@ -1,28 +1,29 @@
 """
 =============================================================================
-DAILY SCHEDULER — runs run_daily.py 90 minutes before each MLB game window
+DAILY SCHEDULER — registers one-shot launchd jobs to run run_daily.py
+                  90 minutes before each MLB game window
 =============================================================================
 Launched at 8am every day by launchd (installed via setup_launchd.py).
 
 Flow:
-  1. Fetch today's MLB schedule
-  2. Group games into time windows (games within 20 min of each other share
+  1. Clean up any stale run plists from previous days
+  2. Fetch today's MLB schedule
+  3. Group games into time windows (games within 20 min of each other share
      a window — one run covers all of them)
-  3. For each window, sleep until T-90 min then run run_daily.py
-  4. Repeat for every window throughout the day
+  4. For each window, write a one-shot launchd plist for T-90 and load it
+     (launchd owns the timer — survives machine sleep/wake)
+  5. Exit immediately — no long sleep in this process
 
 Example — 3:05 PM + 3:10 PM + 10:05 PM games:
-  → Run 1 at 1:35 PM  (covers the early games)
-  → Run 2 at 8:35 PM  (covers the night game with confirmed lineups)
+  → Registers plist to run at 1:35 PM  (covers the early games)
+  → Registers plist to run at 8:35 PM  (covers the night game)
 
 No games today → exits silently.
-Already past T-90 for a window → skips that window (or runs immediately
-if we're between T-90 and first pitch).
+Already past T-90 for a window → runs immediately instead of scheduling.
 =============================================================================
 """
 
 import sys
-import time
 import subprocess
 import requests
 from datetime import datetime, timezone, timedelta
@@ -34,11 +35,12 @@ WINDOW_GAP  = timedelta(minutes=20)   # games within 20 min share a run
 LOG_DIR     = BASE_DIR / "logs"
 LOG_DIR.mkdir(exist_ok=True)
 
+AGENTS_DIR  = Path.home() / "Library" / "LaunchAgents"
+RUN_LABEL_PREFIX = "com.baseballmodels.run."
+
 
 def get_game_times_utc(date_str: str) -> list:
-    """
-    Return sorted list of UTC-aware game start times for date_str.
-    """
+    """Return sorted list of UTC-aware game start times for date_str."""
     resp = requests.get(
         "https://statsapi.mlb.com/api/v1/schedule",
         params={"sportId": 1, "date": date_str},
@@ -50,7 +52,7 @@ def get_game_times_utc(date_str: str) -> list:
     times = []
     for date_entry in data.get("dates", []):
         for game in date_entry.get("games", []):
-            gt = game.get("gameDate")   # e.g. "2026-03-24T17:10:00Z"
+            gt = game.get("gameDate")   # e.g. "2026-03-25T17:10:00Z"
             if gt:
                 times.append(datetime.fromisoformat(gt.replace("Z", "+00:00")))
 
@@ -66,7 +68,7 @@ def group_into_windows(game_times: list) -> list:
     if not game_times:
         return []
 
-    windows    = []
+    windows      = []
     window_start = game_times[0]
 
     for t in game_times[1:]:
@@ -87,8 +89,76 @@ def log(msg: str):
         f.write(line + "\n")
 
 
+def cleanup_stale_run_plists():
+    """Unload and delete run plists from previous days."""
+    today_str = datetime.now().strftime("%Y%m%d")
+    for plist in AGENTS_DIR.glob(f"{RUN_LABEL_PREFIX}*.plist"):
+        # Stem: com.baseballmodels.run.YYYYMMDDHHMM
+        date_part = plist.stem.replace(RUN_LABEL_PREFIX, "")[:8]
+        if date_part < today_str:
+            subprocess.run(["launchctl", "unload", str(plist)], capture_output=True)
+            plist.unlink()
+            log(f"Cleaned up stale plist: {plist.name}")
+
+
+def schedule_via_launchd(window_time: datetime, index: int, total: int):
+    """Write and load a one-shot launchd plist to run run_daily.py at T-90."""
+    run_at       = window_time - LEAD_TIME
+    run_at_local = run_at.astimezone()
+    label        = f"{RUN_LABEL_PREFIX}{run_at_local.strftime('%Y%m%d%H%M')}"
+    plist_path   = AGENTS_DIR / f"{label}.plist"
+    stamp        = run_at_local.strftime("%Y%m%d_%H%M")
+
+    plist = f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{label}</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>{sys.executable}</string>
+        <string>{BASE_DIR / "run_daily.py"}</string>
+    </array>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>{run_at_local.hour}</integer>
+        <key>Minute</key>
+        <integer>{run_at_local.minute}</integer>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>{LOG_DIR / f"run_{stamp}_stdout.log"}</string>
+
+    <key>StandardErrorPath</key>
+    <string>{LOG_DIR / f"run_{stamp}_stderr.log"}</string>
+
+    <key>KeepAlive</key>
+    <false/>
+
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>
+"""
+    plist_path.write_text(plist)
+    subprocess.run(["launchctl", "unload", str(plist_path)], capture_output=True)
+    result = subprocess.run(["launchctl", "load", str(plist_path)],
+                            capture_output=True, text=True)
+    if result.returncode != 0:
+        log(f"  ERROR registering window {index}: {result.stderr.strip()}")
+    else:
+        log(f"  Window {index}/{total} registered → run_daily.py at "
+            f"{run_at_local.strftime('%-I:%M %p %Z')} "
+            f"(first pitch {window_time.astimezone().strftime('%-I:%M %p %Z')})")
+
+
 def run_models():
-    log("Launching run_daily.py...")
+    log("Launching run_daily.py immediately (T-90 already passed)...")
     result = subprocess.run(
         [sys.executable, str(BASE_DIR / "run_daily.py")],
         capture_output=False,
@@ -107,11 +177,14 @@ def main():
     if today < SEASON_START:
         log(f"Before Opening Day ({SEASON_START}) — skipping.")
         return
-    today = today.strftime("%Y-%m-%d")
-    log(f"Scheduler started — checking MLB schedule for {today}")
+
+    cleanup_stale_run_plists()
+
+    today_str = today.strftime("%Y-%m-%d")
+    log(f"Scheduler started — checking MLB schedule for {today_str}")
 
     try:
-        game_times = get_game_times_utc(today)
+        game_times = get_game_times_utc(today_str)
     except Exception as e:
         log(f"ERROR fetching schedule: {e}")
         sys.exit(1)
@@ -126,12 +199,12 @@ def main():
     try:
         from utils.notifier import notify_run_status
         run_times = [
-            (window_time - LEAD_TIME).astimezone().strftime("%-I:%M %p %Z")
-            for window_time in windows
+            (w - LEAD_TIME).astimezone().strftime("%-I:%M %p %Z")
+            for w in windows
         ]
         first_pitch_times = [
-            window_time.astimezone().strftime("%-I:%M %p %Z")
-            for window_time in windows
+            w.astimezone().strftime("%-I:%M %p %Z")
+            for w in windows
         ]
         lines = [f"{len(game_times)} game(s) · {len(windows)} model run(s) scheduled"]
         for fp, rt in zip(first_pitch_times, run_times):
@@ -140,28 +213,23 @@ def main():
     except Exception as e:
         log(f"Status notification failed: {e}")
 
+    now_utc = datetime.now(timezone.utc)
     for i, window_time in enumerate(windows, 1):
         run_at    = window_time - LEAD_TIME
-        now_utc   = datetime.now(timezone.utc)
         wait_secs = (run_at - now_utc).total_seconds()
-
-        local_game = window_time.astimezone().strftime("%I:%M %p %Z")
-        local_run  = run_at.astimezone().strftime("%I:%M %p %Z")
-        log(f"Window {i}/{len(windows)}: first pitch {local_game} → run at {local_run}")
 
         if wait_secs < -LEAD_TIME.total_seconds():
             # More than 90 min past first pitch — game is underway, skip
-            log(f"  Window {i} already in progress — skipping.")
+            log(f"Window {i}/{len(windows)}: game already in progress — skipping.")
             continue
 
-        if wait_secs > 0:
-            log(f"  Sleeping {wait_secs / 60:.1f} minutes until window {i}...")
-            time.sleep(wait_secs)
-
+        if wait_secs <= 0:
+            # T-90 is now or just passed — run immediately
+            log(f"Window {i}/{len(windows)}: T-90 already passed — running immediately.")
+            run_models()
         else:
-            log(f"  T-90 already passed for window {i} — running immediately.")
-
-        run_models()
+            # Register a launchd job; this process can now exit cleanly
+            schedule_via_launchd(window_time, i, len(windows))
 
 
 if __name__ == "__main__":
