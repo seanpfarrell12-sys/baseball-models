@@ -667,10 +667,18 @@ def run_nrfi_export(target_date: str = None, verbose: bool = True) -> pd.DataFra
     # ── Lineups ───────────────────────────────────────────────────────────────
     print(f"\n[ Lineups ] Fetching confirmed lineups...")
     try:
-        lineups = get_lineups(today_str)
+        lineups, lineup_sources = get_lineups(today_str, return_sources=True)
     except Exception as e:
         print(f"  WARNING: lineup fetch failed — {e}")
-        lineups = {}
+        lineups, lineup_sources = {}, {}
+
+    confirmed_teams = {t for t, src in lineup_sources.items() if src == "confirmed"}
+    projected_teams = set(lineups.keys()) - confirmed_teams
+    if projected_teams:
+        print(f"  Skipping projected lineups for: {', '.join(sorted(projected_teams))}")
+    if not confirmed_teams:
+        print("  No confirmed lineups yet — re-run at T-90 before first pitch.")
+        return pd.DataFrame()
 
     # ── NRFI/YRFI Odds ────────────────────────────────────────────────────────
     print(f"\n[ Odds ] Fetching NRFI/YRFI market odds...")
@@ -702,7 +710,13 @@ def run_nrfi_export(target_date: str = None, verbose: bool = True) -> pd.DataFra
         home_sp_hand  = matchup.get("home_sp_hand", matchup.get("home_pitcher_hand", "R"))
         away_sp_hand  = matchup.get("away_sp_hand", matchup.get("away_pitcher_hand", "R"))
 
-        # Top-3 lineup slots (from confirmed lineups if available)
+        # Skip games where either team's lineup is not yet confirmed
+        if lineup_sources.get(home_team) != "confirmed" or \
+           lineup_sources.get(away_team) != "confirmed":
+            print(f"  Skipping {away_team}@{home_team} — lineup not confirmed yet.")
+            continue
+
+        # Top-3 lineup slots (from confirmed lineups only)
         def _top3(team_key):
             team_lu = lineups.get(team_key, [])
             # lineups values are plain lists of player name strings
