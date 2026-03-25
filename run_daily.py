@@ -193,7 +193,8 @@ def run_pitcher_outs():
 
 def run_nrfi():
     m = load_export_module("nrfi", "04_export_nrfi.py")
-    df = m.run_nrfi_export(target_date=today_str, verbose=True)
+    nrfi_date = datetime.strptime(today_str, "%Y%m%d").strftime("%Y-%m-%d")
+    df = m.run_nrfi_export(target_date=nrfi_date, verbose=True)
     if df is None or df.empty:
         print("  No NRFI/YRFI games scored — skipping.")
         return None
@@ -242,7 +243,10 @@ if __name__ == "__main__":
     from utils.notifier import send_daily_picks
     from utils.probable_starters import get_todays_game_status
     scored_games, pending_games = get_todays_game_status()
-    send_daily_picks(results, today_str, scored_games, pending_games)
+    try:
+        send_daily_picks(results, today_str, scored_games, pending_games)
+    except Exception as e:
+        print(f"  WARNING: notification failed — {e}")
 
     # ── Combined Excel workbook ────────────────────────────────────────────
     import pandas as pd

@@ -67,7 +67,7 @@ def _normalize_name(name: str) -> str:
     return re.sub(r"[^a-z ]", "", name.lower()).strip()
 
 
-def _best_name_match(target: str, candidates: list[str], cutoff: float = 0.75) -> str | None:
+def _best_name_match(target: str, candidates: list, cutoff: float = 0.75):
     t = _normalize_name(target)
     norm_map = {_normalize_name(c): c for c in candidates}
     matches = difflib.get_close_matches(t, norm_map.keys(), n=1, cutoff=cutoff)
