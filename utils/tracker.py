@@ -619,7 +619,7 @@ def print_performance_summary(n_days: int = 30):
     ].copy()
 
     if recent.empty:
-        print("  (tracker) No graded picks in the last {n_days} days.")
+        print(f"  (tracker) No graded picks in the last {n_days} days.")
         return
 
     recent["pnl"] = pd.to_numeric(recent["pnl"], errors="coerce").fillna(0)

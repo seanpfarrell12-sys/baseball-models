@@ -140,7 +140,12 @@ def run_hitter_tb():
     if odds_df.empty:
         manual_path = os.path.join(BASE_DIR, "data", "processed",
                                    "hitter_tb_odds_today.csv")
-        odds_df = m.load_prop_odds_manual(manual_path)
+        if os.path.exists(manual_path):
+            odds_df = m.load_prop_odds_manual(manual_path)
+        else:
+            print("  No prop odds available — skipping hitter TB edge calculation.")
+            print("  (Check AN token or manually supply hitter_tb_odds_today.csv)")
+            return None
 
     edge_report = m.build_tb_edge_report(predictions_df, odds_df)
     print(m.generate_daily_summary(edge_report))
@@ -172,7 +177,12 @@ def run_pitcher_outs():
     if odds_df.empty:
         manual_path = os.path.join(BASE_DIR, "data", "processed",
                                    "pitcher_outs_odds_today.csv")
-        odds_df = m.load_prop_odds_manual(manual_path)
+        if os.path.exists(manual_path):
+            odds_df = m.load_prop_odds_manual(manual_path)
+        else:
+            print("  No prop odds available — skipping pitcher outs edge calculation.")
+            print("  (Check AN token or manually supply pitcher_outs_odds_today.csv)")
+            return None
 
     edge_report = m.build_pitcher_edge_report(predictions_df, odds_df)
     print(m.generate_daily_summary(edge_report))

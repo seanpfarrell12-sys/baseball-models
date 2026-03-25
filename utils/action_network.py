@@ -479,7 +479,7 @@ def fetch_player_props(game_id: str, prop_type: str = "batter_total_bases",
       /events/{game_id}/player-props
     We try multiple paths and return whichever works.
     """
-    if not (AUTH_TOKEN or token):
+    if not (AUTH_TOKEN or token or _load_token_from_file()):
         print("  ERROR: Props require AUTH_TOKEN. See module docstring for setup.")
         return pd.DataFrame()
 

@@ -153,7 +153,9 @@ def _send_discord_embed(title: str, fields: list, footer: str = ""):
     if footer:
         embed["footer"] = {"text": footer}
 
-    requests.post(url, json={"embeds": [embed]}, timeout=10)
+    resp = requests.post(url, json={"embeds": [embed]}, timeout=10)
+    if resp.status_code not in (200, 204):
+        print(f"  (notifier) Discord error {resp.status_code}: {resp.text[:200]}")
 
 
 # =============================================================================
