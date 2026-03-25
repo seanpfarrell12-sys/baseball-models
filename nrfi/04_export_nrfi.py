@@ -167,6 +167,16 @@ def load_batting_splits_for_scoring():
     return lhp, rhp
 
 
+def load_chadwick_for_scoring() -> pd.DataFrame:
+    """Load Chadwick register (name_first, name_last, key_mlbam) for name→MLBAM bridge."""
+    path = os.path.join(RAW_DIR, "raw_chadwick.csv")
+    if not os.path.exists(path):
+        return pd.DataFrame()
+    chad = pd.read_csv(path, low_memory=False)
+    chad["key_mlbam"] = pd.to_numeric(chad["key_mlbam"], errors="coerce")
+    return chad.dropna(subset=["key_mlbam"])
+
+
 # =============================================================================
 # REAL-TIME WEATHER (OPEN-METEO FORECAST)
 # =============================================================================
@@ -320,6 +330,11 @@ def get_top3_features(top3_names: list, sp_hand: str,
     Build average platoon batting stats for the top-3 lineup slots.
 
     sp_hand: 'L' or 'R' — determines which splits file to use.
+
+    Lookup strategy (most reliable first):
+      1. name → MLBAM (Chadwick) → key_mlbam in splits (Statcast-derived)
+      2. name → MLBAM (Chadwick) → IDfg in splits
+      3. name_norm string match against splits Name column (FG-API fallback)
     """
     splits_df = df_lhp if sp_hand == "L" else df_rhp
     FEAT_COLS  = {
@@ -335,37 +350,70 @@ def get_top3_features(top3_names: list, sp_hand: str,
     if splits_df.empty:
         return {f: None for f in FEAT_COLS}
 
-    # Normalise column names once
+    # ── Build name → MLBAM bridge from Chadwick ───────────────────────────────
+    name_to_mlbam = {}
+    if chad is not None and not chad.empty and \
+            "name_first" in chad.columns and "name_last" in chad.columns:
+        for _, crow in chad.iterrows():
+            full = normalize_name(f"{crow['name_first']} {crow['name_last']}")
+            name_to_mlbam[full] = int(crow["key_mlbam"])
+
+    # ── Pre-index splits by (key_mlbam, season) and (IDfg, season) ───────────
+    has_mlbam = "key_mlbam" in splits_df.columns
+    has_idfg  = "IDfg" in splits_df.columns
+    yr_col    = "season" if "season" in splits_df.columns else "Season"
+
+    mlbam_idx = {}
+    idfg_idx  = {}
+    for _, row in splits_df.iterrows():
+        yr = row.get(yr_col)
+        if has_mlbam and pd.notna(row.get("key_mlbam")) and pd.notna(yr):
+            mlbam_idx[(int(row["key_mlbam"]), int(yr))] = row
+        if has_idfg and pd.notna(row.get("IDfg")) and pd.notna(yr):
+            idfg_idx[(int(row["IDfg"]), int(yr))] = row
+
+    # ── Name-norm fallback index ───────────────────────────────────────────────
     if "name_norm" not in splits_df.columns:
-        name_col = "Name" if "Name" in splits_df.columns else \
-                   "PlayerName" if "PlayerName" in splits_df.columns else None
+        name_col = next((c for c in ["Name", "PlayerName"] if c in splits_df.columns), None)
         if name_col:
             splits_df = splits_df.copy()
             splits_df["name_norm"] = splits_df[name_col].apply(normalize_name)
+    name_idx = {}
+    if "name_norm" in splits_df.columns:
+        for _, row in splits_df.iterrows():
+            yr = row.get(yr_col)
+            if pd.notna(yr):
+                name_idx[(row["name_norm"], int(yr))] = row
+
+    def _lookup_row(name: str):
+        norm  = normalize_name(name)
+        mid   = name_to_mlbam.get(norm)
+        for yr in (CURRENT_SEASON - 1, CURRENT_SEASON):
+            # 1. key_mlbam
+            if mid and (mid, yr) in mlbam_idx:
+                return mlbam_idx[(mid, yr)]
+            # 2. IDfg (same as key_mlbam in Statcast splits, or FGid)
+            if mid and (mid, yr) in idfg_idx:
+                return idfg_idx[(mid, yr)]
+            # 3. name string match
+            if (norm, yr) in name_idx:
+                return name_idx[(norm, yr)]
+        return None
 
     for name in top3_names:
         if not name:
             continue
-        norm = normalize_name(name)
-        # Get prior-year stats
-        for yr in (CURRENT_SEASON - 1, CURRENT_SEASON):
-            yr_col = "season" if "season" in splits_df.columns else "Season"
-            mask   = (splits_df.get("name_norm", pd.Series()) == norm)
-            if yr_col in splits_df.columns:
-                mask = mask & (splits_df[yr_col] == yr)
-            rows = splits_df[mask]
-            if rows.empty:
-                continue
-            row = rows.iloc[-1]
-            for feat, candidates in FEAT_COLS.items():
-                for col in candidates:
-                    if col in row.index and pd.notna(row[col]):
-                        val = row[col]
-                        if isinstance(val, str) and val.endswith("%"):
-                            val = float(val.replace("%", "")) / 100
-                        vals[feat].append(float(val))
-                        break
-            break
+        row = _lookup_row(name)
+        if row is None:
+            continue
+        for feat, candidates in FEAT_COLS.items():
+            for col in candidates:
+                if col in row.index and pd.notna(row[col]):
+                    val = row[col]
+                    if isinstance(val, str) and val.endswith("%"):
+                        val = float(val.replace("%", "")) / 100
+                    vals[feat].append(float(val))
+                    break
 
     return {f: float(np.mean(v)) if v else None for f, v in vals.items()}
 
@@ -416,7 +464,8 @@ def score_game(game: dict, model, calibrator, feat_cols: list,
                fg_df: pd.DataFrame,
                df_lhp: pd.DataFrame, df_rhp: pd.DataFrame,
                stadium_meta: dict, park_hr_factors: dict,
-               game_dt: datetime) -> dict:
+               game_dt: datetime,
+               chad: pd.DataFrame = None) -> dict:
     """
     Build feature vector for one game and return scored result dict.
 
@@ -445,12 +494,12 @@ def score_game(game: dict, model, calibrator, feat_cols: list,
     # Home top-3 face the AWAY SP hand
     home_top3 = get_top3_features(
         game.get("home_top3_names", []), game.get("away_sp_hand", "R"),
-        df_lhp, df_rhp,
+        df_lhp, df_rhp, chad=chad,
     )
     # Away top-3 face the HOME SP hand
     away_top3 = get_top3_features(
         game.get("away_top3_names", []), game.get("home_sp_hand", "R"),
-        df_lhp, df_rhp,
+        df_lhp, df_rhp, chad=chad,
     )
 
     # ── Environmental features ────────────────────────────────────────────────
@@ -597,6 +646,9 @@ def run_nrfi_export(target_date: str = None, verbose: bool = True) -> pd.DataFra
     print("[ Load ] Batting splits...")
     df_lhp, df_rhp = load_batting_splits_for_scoring()
 
+    print("[ Load ] Chadwick register (name→MLBAM bridge)...")
+    chad = load_chadwick_for_scoring()
+
     # ── Probable starters ─────────────────────────────────────────────────────
     print(f"\n[ Starters ] Fetching probable starters for {today_str}...")
     try:
@@ -684,6 +736,7 @@ def run_nrfi_export(target_date: str = None, verbose: bool = True) -> pd.DataFra
                 game_input, model, calibrator, feat_cols,
                 fg_df, df_lhp, df_rhp,
                 stadium_meta, park_hr_factors, today_dt,
+                chad=chad,
             )
         except Exception as e:
             print(f"  WARNING: scoring failed for {away_team}@{home_team} — {e}")

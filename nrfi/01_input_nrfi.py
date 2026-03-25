@@ -360,19 +360,21 @@ def pull_batting_splits_nrfi(stat_years: list) -> tuple:
         print("  Pulling Chadwick Bureau register...")
         try:
             chad = pyb.chadwick_register()
-            chad = chad[["key_mlbam", "key_fangraphs"]].dropna()
+            keep = [c for c in ["key_mlbam", "key_fangraphs", "name_first", "name_last"]
+                    if c in chad.columns]
+            chad = chad[keep].dropna(subset=["key_mlbam", "key_fangraphs"])
             chad["key_mlbam"]     = chad["key_mlbam"].astype(int)
             chad["key_fangraphs"] = chad["key_fangraphs"].astype(int)
             chad.to_csv(chadwick_path, index=False)
             print(f"    Saved {len(chad):,} rows → {chadwick_path}")
         except Exception as e:
             print(f"    WARNING: Chadwick pull failed — {e}; using MLBAM as IDfg fallback")
-            chad = pd.DataFrame(columns=["key_mlbam", "key_fangraphs"])
+            chad = pd.DataFrame(columns=["key_mlbam", "key_fangraphs", "name_first", "name_last"])
     else:
         chad = pd.read_csv(chadwick_path, low_memory=False)
         chad["key_mlbam"]     = pd.to_numeric(chad["key_mlbam"],     errors="coerce")
         chad["key_fangraphs"] = pd.to_numeric(chad["key_fangraphs"], errors="coerce")
-        chad = chad.dropna()
+        chad = chad.dropna(subset=["key_mlbam", "key_fangraphs"])
 
     mlbam_to_fg = (chad.drop_duplicates("key_mlbam")
                        .set_index("key_mlbam")["key_fangraphs"]
