@@ -49,7 +49,7 @@ from utils.probable_starters import (get_games_with_sp_stats, get_lineups,
 # --- Configuration ----------------------------------------------------------
 BASE_DIR   = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PROC_DIR   = os.path.join(BASE_DIR, "data", "processed")
-MODEL_DIR  = os.path.join(BASE_DIR, "models")
+MODEL_DIR  = os.path.join(BASE_DIR, "data", "models")
 EXPORT_DIR = os.path.join(BASE_DIR, "exports")
 
 ODDS_API_KEY       = "fbc985ad430c95d6435cb75210f7b989"

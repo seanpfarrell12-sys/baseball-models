@@ -67,7 +67,7 @@ from utils.probable_starters import (get_games_with_sp_stats,
 # --- Configuration ----------------------------------------------------------
 BASE_DIR   = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PROC_DIR   = os.path.join(BASE_DIR, "data", "processed")
-MODEL_DIR  = os.path.join(BASE_DIR, "models")
+MODEL_DIR  = os.path.join(BASE_DIR, "data", "models")
 EXPORT_DIR = os.path.join(BASE_DIR, "exports")
 
 # The Odds API (free tier — set your key here or leave empty for manual mode)
@@ -571,7 +571,8 @@ def score_live_games(odds_df: pd.DataFrame) -> pd.DataFrame:
         af = team_feats.get(away, {})
 
         # Prefer individual probable starter stats; fall back to team averages
-        sp_row = sp_lookup.get((home, away), {})
+        _sp = sp_lookup.get((home, away), {})
+        sp_row = _sp.to_dict() if isinstance(_sp, pd.Series) else _sp
         if sp_row:
             h_sp = {k.replace("home_", ""): v for k, v in sp_row.items()
                     if k.startswith("home_sp_")}

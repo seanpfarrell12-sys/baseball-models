@@ -21,6 +21,7 @@ import sys
 import argparse
 import importlib.util
 import traceback
+import pandas as pd
 from datetime import datetime, date, timedelta
 
 BASE_DIR   = os.path.dirname(os.path.abspath(__file__))

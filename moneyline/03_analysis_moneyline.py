@@ -46,7 +46,7 @@ warnings.filterwarnings("ignore")
 
 BASE_DIR   = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PROC_DIR   = os.path.join(BASE_DIR, "data", "processed")
-MODEL_DIR  = os.path.join(BASE_DIR, "models")
+MODEL_DIR  = os.path.join(BASE_DIR, "data", "models")
 EXPORT_DIR = os.path.join(BASE_DIR, "exports")
 
 os.makedirs(MODEL_DIR,  exist_ok=True)
