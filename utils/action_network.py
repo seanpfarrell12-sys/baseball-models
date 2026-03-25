@@ -69,17 +69,24 @@ V2_PROP_TYPE_MAP = {
 # Book IDs for consensus odds (Action Network internal IDs)
 # These are the major US sportsbooks
 BOOK_IDS = {
-    15:  "DraftKings",
-    30:  "FanDuel",
-    76:  "BetMGM",
-    75:  "PointsBet",
-    123: "Caesars",
-    69:  "WynnBet",
-    68:  "Unibet",
-    972: "ESPN BET",
-    71:  "Barstool",
-    247: "SuperBook",
-    79:  "BetRivers",
+    15:   "DraftKings",
+    30:   "FanDuel",
+    76:   "BetMGM",
+    75:   "PointsBet",
+    123:  "Caesars",
+    69:   "WynnBet",
+    68:   "Unibet",
+    972:  "ESPN BET",
+    71:   "Barstool",
+    247:  "SuperBook",
+    79:   "BetRivers",
+    939:  "Caesars (alt)",
+    1005: "Fanatics",
+    1006: "Fliff",
+    1539: "Bet365 (alt)",
+    1903: "ESPN BET (alt)",
+    1963: "Unibet (alt)",
+    1968: "Fliff (alt)",
 }
 DEFAULT_BOOK_IDS = list(BOOK_IDS.keys())
 
@@ -731,50 +738,90 @@ def get_pitcher_outs_odds(game_date: str = None, token: str = None) -> pd.DataFr
 
 def get_nrfi_odds(game_date: str = None, token: str = None) -> pd.DataFrame:
     """
-    Wrapper that returns NRFI/YRFI game-level odds in the format expected
-    by 04_export_nrfi.py.
+    Fetch NRFI/YRFI first-inning total odds from the scoreboard markets field.
 
-    NRFI/YRFI is a game-level market (not a player prop), so the prop_type
-    key depends on the bookmaker's labeling convention.  Common names:
-      "first_inning_score"     — DraftKings, FanDuel
-      "nrfi"                   — BetMGM, Caesars
-      "first_1_innings_score"  — some books
+    The first-inning total (line=0.5) lives in game.markets[book_id]["firstinning"]["total"]
+    in the standard v1 scoreboard response — not in the props endpoint.
+
+    Over 0.5 = YRFI (at least one run scores in the 1st inning)
+    Under 0.5 = NRFI (no runs in the 1st inning)
 
     Returns columns:
       home_team, away_team, game_date,
-      nrfi_over_juice, nrfi_under_juice,
-      nrfi_implied_prob   (= implied P(YRFI) from the under/nrfi side)
+      nrfi_over_juice, nrfi_under_juice, nrfi_implied_prob, n_books
     """
-    # Try multiple prop_type keys used by different books
-    for prop_key in ("nrfi", "first_inning_score", "first_1_innings_score"):
-        df = fetch_all_props_today(
-            prop_type=prop_key,
-            game_date=game_date,
-            token=token,
+    if game_date is None:
+        game_date = date.today().strftime("%Y-%m-%d")
+
+    print(f"  Fetching NRFI/YRFI first-inning odds for {game_date}...")
+
+    session  = build_session(token)
+    book_ids = ",".join(map(str, DEFAULT_BOOK_IDS))
+
+    try:
+        resp = session.get(
+            f"{BASE_URL}/scoreboard/mlb",
+            params={"period": "game", "bookIds": book_ids,
+                    "date": game_date.replace("-", "")},
+            timeout=15,
         )
-        if not df.empty:
-            break
+        resp.raise_for_status()
+        games = resp.json().get("games", [])
+    except Exception as e:
+        print(f"  ERROR fetching NRFI odds: {e}")
+        return pd.DataFrame()
 
-    if df.empty:
-        return df
+    records = []
+    for game in games:
+        home_id = game.get("home_team_id")
+        away_id = game.get("away_team_id")
+        teams   = {t["id"]: t for t in game.get("teams", []) if "id" in t}
 
-    # Standardize column names
-    rename_map = {}
-    if "over_juice"  in df.columns:
-        rename_map["over_juice"]  = "nrfi_over_juice"    # YRFI side
-    if "under_juice" in df.columns:
-        rename_map["under_juice"] = "nrfi_under_juice"   # NRFI side
-    if rename_map:
-        df = df.rename(columns=rename_map)
+        home = teams.get(home_id, {})
+        away = teams.get(away_id, {})
+        home_full = home.get("full_name", "")
+        away_full = away.get("full_name", "")
+        home_abbr = AN_TEAM_MAP.get(home_full, home.get("abbr", ""))
+        away_abbr = AN_TEAM_MAP.get(away_full, away.get("abbr", ""))
 
-    # Compute book's implied P(YRFI) from the YRFI (over/yes) side
-    if "nrfi_over_juice" in df.columns:
-        df["nrfi_implied_prob"] = df["nrfi_over_juice"].apply(
-            lambda j: abs(j) / (abs(j) + 100) if j < 0
-                      else 100 / (j + 100)
-        )
+        # Collect firstinning total odds across all books
+        over_odds  = []
+        under_odds = []
+        for book_markets in game.get("markets", {}).values():
+            for entry in book_markets.get("firstinning", {}).get("total", []):
+                side  = str(entry.get("side", "")).lower()
+                odds  = entry.get("odds")
+                value = entry.get("value")
+                if value == 0.5 and odds is not None:
+                    (over_odds if side == "over" else under_odds).append(float(odds))
 
-    return df
+        if not over_odds and not under_odds:
+            continue
+
+        yrfi_juice = float(np.median(over_odds))  if over_odds  else -110.0
+        nrfi_juice = float(np.median(under_odds)) if under_odds else -110.0
+
+        implied_yrfi = (abs(yrfi_juice) / (abs(yrfi_juice) + 100) if yrfi_juice < 0
+                        else 100 / (yrfi_juice + 100))
+
+        records.append({
+            "home_team":        home_abbr,
+            "away_team":        away_abbr,
+            "home_team_full":   home_full,
+            "away_team_full":   away_full,
+            "game_date":        game_date,
+            "nrfi_over_juice":  yrfi_juice,
+            "nrfi_under_juice": nrfi_juice,
+            "nrfi_implied_prob": round(implied_yrfi, 4),
+            "n_books":          len(over_odds),
+        })
+
+    if records:
+        print(f"  ✓ NRFI/YRFI odds: {len(records)} game(s).")
+    else:
+        print("  No NRFI/YRFI first-inning total odds found.")
+
+    return pd.DataFrame(records)
 
 
 # =============================================================================
