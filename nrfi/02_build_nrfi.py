@@ -524,102 +524,80 @@ def join_sp_features(games: pd.DataFrame,
 
 
 # =============================================================================
-# STEP 5: RETROSHEET TOP-3 LINEUP EXTRACTION
+# STEP 5: TOP-3 LINEUP EXTRACTION FROM STATCAST
 # =============================================================================
 
 def extract_top3_lineups(retro: pd.DataFrame,
                          chad: pd.DataFrame) -> pd.DataFrame:
     """
-    From retrosheet game logs, extract the confirmed batting slots 1-2-3
-    for home and away teams.
+    Extract the actual batting slots 1-2-3 for each team from the inning=1
+    Statcast data (already pulled in Step 1).
 
-    Retrosheet game log columns:
-      h_bat_1_id..h_bat_9_id  — home team batting order (retrosheet IDs)
-      v_bat_1_id..v_bat_9_id  — away team batting order (retrosheet IDs)
-      h_name / v_name         — team codes (retrosheet format)
-      date                    — YYYYMMDD integer
-      game_id                 — unique identifier
+    Logic:
+      - away top-3 = first 3 unique batters with inning_topbot='Top',
+                     ordered by at_bat_number ascending
+      - home top-3 = first 3 unique batters with inning_topbot='Bot',
+                     ordered by at_bat_number ascending
+
+    MLBAM IDs are already present in Statcast — no retrosheet bridge needed.
+    The retro / chad arguments are accepted but unused (kept for call-site
+    compatibility).
 
     Returns a DataFrame with:
       game_date, season, home_team, away_team,
-      home_slot_1_retro, home_slot_2_retro, home_slot_3_retro,
-      away_slot_1_retro, away_slot_2_retro, away_slot_3_retro,
-      [same columns with _mlbam suffix after ID bridge]
+      home_slot_{1,2,3}_mlbam, away_slot_{1,2,3}_mlbam
     """
-    if retro.empty:
+    sc_frames = []
+    for yr in GAME_YEARS:
+        p = os.path.join(RAW_DIR, f"raw_nrfi_statcast_{yr}.csv")
+        if os.path.exists(p):
+            sc_frames.append(pd.read_csv(p, low_memory=False,
+                                         usecols=["game_pk", "game_date",
+                                                  "inning_topbot", "at_bat_number",
+                                                  "batter", "home_team", "away_team",
+                                                  "season"]))
+    if not sc_frames:
+        print("  WARNING: no Statcast files — top-3 lineup features will be null")
         return pd.DataFrame()
 
-    # ── Find batting order columns ────────────────────────────────────────────
-    # Retrosheet column names vary slightly between download formats
-    HOME_SLOT_PATTERNS = [
-        ["h_bat_1_id", "h_bat_2_id", "h_bat_3_id"],  # BEVENT format
-        ["h_bat1_id",  "h_bat2_id",  "h_bat3_id"],
-        ["home_bat_1", "home_bat_2", "home_bat_3"],
-    ]
-    AWAY_SLOT_PATTERNS = [
-        ["v_bat_1_id", "v_bat_2_id", "v_bat_3_id"],
-        ["v_bat1_id",  "v_bat2_id",  "v_bat3_id"],
-        ["away_bat_1", "away_bat_2", "away_bat_3"],
-    ]
+    sc = pd.concat(sc_frames, ignore_index=True)
+    sc["game_date"] = pd.to_datetime(sc["game_date"], errors="coerce")
 
-    home_slots = next(
-        (p for p in HOME_SLOT_PATTERNS if all(c in retro.columns for c in p)),
-        None,
-    )
-    away_slots = next(
-        (p for p in AWAY_SLOT_PATTERNS if all(c in retro.columns for c in p)),
-        None,
-    )
+    # One row per at-bat (deduplicate pitches within same AB)
+    ab = (sc.drop_duplicates(subset=["game_pk", "at_bat_number"])
+            .sort_values(["game_pk", "at_bat_number"]))
 
-    if home_slots is None or away_slots is None:
-        print("  WARNING: batting order columns not found in retrosheet — "
-              "top-3 lineup features will be null")
-        return pd.DataFrame()
-
-    # ── Build per-game lineup table ───────────────────────────────────────────
     rows = []
-    for _, r in retro.iterrows():
-        # Date handling: retrosheet stores as YYYYMMDD int or YYYY-MM-DD string
-        raw_date = r.get("date", r.get("game_date", ""))
-        try:
-            raw_str = str(int(raw_date))
-            gdate   = pd.to_datetime(raw_str, format="%Y%m%d", errors="coerce")
-        except Exception:
-            gdate   = pd.to_datetime(raw_date, errors="coerce")
+    for game_pk, grp in ab.groupby("game_pk"):
+        top  = grp[grp["inning_topbot"] == "Top"]
+        bot  = grp[grp["inning_topbot"] == "Bot"]
 
-        h_team = RETRO_TO_STD.get(str(r.get("h_name", r.get("home_team", ""))), "")
-        v_team = RETRO_TO_STD.get(str(r.get("v_name", r.get("away_team", ""))), "")
+        away3 = top["batter"].tolist()[:3]
+        home3 = bot["batter"].tolist()[:3]
 
+        # Pad if fewer than 3 batters appeared (e.g., walk-off first half)
+        while len(away3) < 3:
+            away3.append(np.nan)
+        while len(home3) < 3:
+            home3.append(np.nan)
+
+        row = grp.iloc[0]
         rows.append({
-            "game_date":         gdate,
-            "season":            r.get("season"),
-            "home_team":         h_team,
-            "away_team":         v_team,
-            "home_slot_1_retro": r.get(home_slots[0]),
-            "home_slot_2_retro": r.get(home_slots[1]),
-            "home_slot_3_retro": r.get(home_slots[2]),
-            "away_slot_1_retro": r.get(away_slots[0]),
-            "away_slot_2_retro": r.get(away_slots[1]),
-            "away_slot_3_retro": r.get(away_slots[2]),
+            "game_date":          row["game_date"],
+            "season":             row["season"],
+            "home_team":          row["home_team"],
+            "away_team":          row["away_team"],
+            "home_slot_1_mlbam":  home3[0],
+            "home_slot_2_mlbam":  home3[1],
+            "home_slot_3_mlbam":  home3[2],
+            "away_slot_1_mlbam":  away3[0],
+            "away_slot_2_mlbam":  away3[1],
+            "away_slot_3_mlbam":  away3[2],
         })
 
     lu = pd.DataFrame(rows)
     lu["game_date"] = pd.to_datetime(lu["game_date"], errors="coerce")
-
-    # ── Bridge retrosheet IDs → MLBAM IDs ────────────────────────────────────
-    if not chad.empty and "key_retro" in chad.columns:
-        retro_map = (chad[["key_retro", "key_mlbam"]]
-                     .dropna()
-                     .drop_duplicates("key_retro")
-                     .set_index("key_retro")["key_mlbam"]
-                     .to_dict())
-        for side in ("home", "away"):
-            for slot in (1, 2, 3):
-                col_r = f"{side}_slot_{slot}_retro"
-                col_m = f"{side}_slot_{slot}_mlbam"
-                lu[col_m] = lu[col_r].map(retro_map)
-
-    print(f"  Retrosheet lineups extracted: {len(lu):,} games")
+    print(f"  Statcast lineups extracted: {len(lu):,} games")
     return lu
 
 
@@ -719,21 +697,44 @@ def build_top3_features(games: pd.DataFrame,
     lhp_lkp = _splits_lookup(df_lhp)
     rhp_lkp = _splits_lookup(df_rhp)
 
+    # Also build a direct MLBAM-keyed lookup as fallback (our Statcast-derived
+    # splits store key_mlbam; some players lack a FGid in Chadwick)
+    def _splits_lookup_mlbam(splits_df: pd.DataFrame) -> dict:
+        key_feats = ["wrc_plus", "obp", "iso", "k_pct", "bb_pct"]
+        avail = [c for c in key_feats if c in splits_df.columns]
+        lkp = {}
+        for _, row in splits_df.iterrows():
+            mid = row.get("key_mlbam")
+            yr  = row.get("season")
+            if pd.isna(mid) or pd.isna(yr):
+                continue
+            lkp[(int(mid), int(yr))] = {c: row.get(c) for c in avail}
+        return lkp
+
+    lhp_lkp_mlbam = _splits_lookup_mlbam(df_lhp) if "key_mlbam" in df_lhp.columns else {}
+    rhp_lkp_mlbam = _splits_lookup_mlbam(df_rhp) if "key_mlbam" in df_rhp.columns else {}
+
     def _get_stats(mlbam_id, season, sp_hand, lookup_lhp, lookup_rhp):
         """Return batting split stats dict for one batter vs one SP hand."""
         if pd.isna(mlbam_id) or pd.isna(season):
             return {}
-        fgid = mlbam_to_fg.get(int(mlbam_id))
-        if fgid is None:
-            return {}
-        key    = (int(fgid), int(season) - 1)   # prior year
         lookup = lookup_lhp if sp_hand == "L" else lookup_rhp
-        stats  = lookup.get(key, {})
-        if not stats:
-            # Fallback: same season if prior year unavailable
-            key_same = (int(fgid), int(season))
-            stats    = lookup.get(key_same, {})
-        return stats
+        lkp_mlbam = lhp_lkp_mlbam if sp_hand == "L" else rhp_lkp_mlbam
+        mid = int(mlbam_id)
+        fgid = mlbam_to_fg.get(mid)
+        # Try FGid prior-year, FGid same-season, MLBAM prior-year, MLBAM same-season
+        for key in [
+            (int(fgid), int(season) - 1) if fgid else None,
+            (int(fgid), int(season))     if fgid else None,
+            (mid, int(season) - 1),
+            (mid, int(season)),
+        ]:
+            if key is None:
+                continue
+            stats = lookup.get(key) or lkp_mlbam.get(key)
+            if stats:
+                return stats
+        return {}
 
     # ── Compute per-game top-3 averages ───────────────────────────────────────
     feat_names = ["wrc_plus", "obp", "iso", "k_pct", "bb_pct"]

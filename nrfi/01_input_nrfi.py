@@ -259,73 +259,139 @@ def pull_fg_pitching_nrfi(stat_years: list) -> pd.DataFrame:
 # =============================================================================
 def pull_batting_splits_nrfi(stat_years: list) -> tuple:
     """
-    Returns (df_lhp, df_rhp) batting splits for joining to top-3 hitters.
-    Reuses the FanGraphs splits API (split codes 117=vs LHP, 118=vs RHP).
-    If the files already exist from the hitter_tb model, load them directly.
+    Compute first-inning batting platoon splits directly from Statcast data.
+
+    Rather than relying on the FanGraphs splits API (which returns 500 errors),
+    we aggregate wOBA, K%, BB%, ISO, and OBP from the already-pulled inning=1
+    Statcast files.  Per-season splits for batters with < MIN_SPLIT_PA are
+    supplemented with their pooled career average across all available seasons.
+
+    Output columns (matching what 02_build_nrfi.py expects):
+      IDfg, key_mlbam, season, wRC+, OBP, ISO, K%, BB%
+
+    Note: wRC+ column is populated with first-inning wOBA (0.200–0.450 scale).
+    Both training and scoring use the same scale so model weights learn correctly.
     """
+    MIN_SPLIT_PA = 10
+
     lhp_path = os.path.join(RAW_DIR, "raw_batting_splits_lhp.csv")
     rhp_path = os.path.join(RAW_DIR, "raw_batting_splits_rhp.csv")
 
-    if os.path.exists(lhp_path) and os.path.exists(rhp_path):
-        print("    Batting splits: loading from existing hitter_tb raw files")
-        return pd.read_csv(lhp_path, low_memory=False), \
-               pd.read_csv(rhp_path, low_memory=False)
-
-    # Pull fresh if not available
-    base_url = "https://www.fangraphs.com/api/leaders/splits/splits-leaders"
-    SPLIT_CODES = {"vs_lhp": 117, "vs_rhp": 118}
-
-    def _fetch(split_code, split_label, year):
-        params = {
-            "strPos": "all", "season": year, "season1": year,
-            "mingames": 0, "minpa": 50, "split": split_code,
-            "splitTeams": False, "statType": "player",
-            "statgroup": "dashboard",
-            "startDate": f"{year}-01-01", "endDate": f"{year}-12-31",
-            "players": "", "z_players": "",
-        }
-        try:
-            r = requests.post(base_url, data=params,
-                              headers={"User-Agent": "baseball-research/1.0",
-                                       "Referer": "https://www.fangraphs.com/"},
-                              timeout=30)
-            r.raise_for_status()
-            data = r.json()
-            rows = data.get("data", data) if isinstance(data, dict) else data
-            df   = pd.DataFrame(rows)
-            df["season"]      = year
-            df["split_label"] = split_label
-            return df
-        except Exception as e:
-            print(f"      WARNING: FG splits {split_label} {year} — {e}")
-            return pd.DataFrame()
-
-    lhp_frames, rhp_frames = [], []
+    # ── Load existing inning=1 Statcast files ────────────────────────────────
+    sc_frames = []
     for yr in stat_years:
-        print(f"  Pulling batting splits {yr}...")
-        lhp_frames.append(_fetch(SPLIT_CODES["vs_lhp"], "vs_lhp", yr))
-        rhp_frames.append(_fetch(SPLIT_CODES["vs_rhp"], "vs_rhp", yr))
-        time.sleep(1.5)
-
-    lhp_valid = [f for f in lhp_frames if not f.empty]
-    rhp_valid = [f for f in rhp_frames if not f.empty]
-    if not lhp_valid or not rhp_valid:
-        print("  WARNING: FG batting splits returned no data — platoon features will be null")
+        p = os.path.join(RAW_DIR, f"raw_nrfi_statcast_{yr}.csv")
+        if os.path.exists(p):
+            sc_frames.append(pd.read_csv(p, low_memory=False))
+    if not sc_frames:
+        print("  WARNING: no Statcast files found — platoon splits will be null")
         return pd.DataFrame(), pd.DataFrame()
-    df_lhp = pd.concat(lhp_valid, ignore_index=True)
-    df_rhp = pd.concat(rhp_valid, ignore_index=True)
 
-    for df in [df_lhp, df_rhp]:
-        for col in ["playerid", "IDfg", "PlayerID"]:
-            if col in df.columns:
-                df.rename(columns={col: "IDfg"}, inplace=True)
-                break
-        if "IDfg" in df.columns:
-            df["IDfg"] = pd.to_numeric(df["IDfg"], errors="coerce")
+    sc = pd.concat(sc_frames, ignore_index=True)
+
+    # Keep only rows that are plate-appearance endings (woba_denom == 1)
+    pa = sc[sc["woba_denom"] == 1].copy()
+    pa["is_k"]  = (pa["events"] == "strikeout").astype(int)
+    pa["is_bb"] = pa["events"].isin(["walk", "intent_walk"]).astype(int)
+    pa["is_hbp"]= (pa["events"] == "hit_by_pitch").astype(int)
+    pa["is_hit"]= pa["events"].isin(
+        ["single", "double", "triple", "home_run"]).astype(int)
+
+    # Compute per (batter, p_throws, season) aggregates
+    grp = pa.groupby(["batter", "p_throws", "season"])
+    agg = grp.agg(
+        pa_count  = ("woba_denom", "sum"),
+        woba_sum  = ("woba_value", "sum"),
+        iso_sum   = ("iso_value",  "sum"),
+        k_count   = ("is_k",       "sum"),
+        bb_count  = ("is_bb",      "sum"),
+        hbp_count = ("is_hbp",     "sum"),
+        hit_count = ("is_hit",     "sum"),
+    ).reset_index()
+
+    agg["wOBA"]  = agg["woba_sum"]  / agg["pa_count"]
+    agg["ISO"]   = agg["iso_sum"]   / agg["pa_count"]
+    agg["K%"]    = agg["k_count"]   / agg["pa_count"]
+    agg["BB%"]   = agg["bb_count"]  / agg["pa_count"]
+    agg["OBP"]   = (agg["hit_count"] + agg["bb_count"] + agg["hbp_count"]) \
+                   / agg["pa_count"]
+    # Expose wOBA as "wRC+" (build script looks for "wRC+" first; same scale used
+    # in both training and live scoring so model weights are internally consistent)
+    agg["wRC+"]  = agg["wOBA"]
+
+    # ── Supplement thin seasons with career-pooled average ───────────────────
+    career = pa.groupby(["batter", "p_throws"]).agg(
+        pa_count  = ("woba_denom", "sum"),
+        woba_sum  = ("woba_value", "sum"),
+        iso_sum   = ("iso_value",  "sum"),
+        k_count   = ("is_k",       "sum"),
+        bb_count  = ("is_bb",      "sum"),
+        hbp_count = ("is_hbp",     "sum"),
+        hit_count = ("is_hit",     "sum"),
+    ).reset_index()
+    career["wOBA"] = career["woba_sum"]  / career["pa_count"]
+    career["ISO"]  = career["iso_sum"]   / career["pa_count"]
+    career["K%"]   = career["k_count"]   / career["pa_count"]
+    career["BB%"]  = career["bb_count"]  / career["pa_count"]
+    career["OBP"]  = (career["hit_count"] + career["bb_count"] + career["hbp_count"]) \
+                     / career["pa_count"]
+    career["wRC+"] = career["wOBA"]
+
+    # For each season-year combo, fill thin rows with career values
+    rows_out = []
+    for yr in stat_years:
+        yr_agg = agg[agg["season"] == yr].copy()
+        thin   = yr_agg[yr_agg["pa_count"] < MIN_SPLIT_PA]["batter"].unique()
+        # Supplement thin batters with career row stamped with this season
+        if len(thin):
+            fill = career[career["batter"].isin(thin)].copy()
+            fill["season"] = yr
+            yr_agg = pd.concat(
+                [yr_agg[yr_agg["pa_count"] >= MIN_SPLIT_PA], fill],
+                ignore_index=True
+            )
+        rows_out.append(yr_agg)
+
+    splits = pd.concat(rows_out, ignore_index=True)
+
+    # ── Bridge MLBAM → FGid via Chadwick register ────────────────────────────
+    chadwick_path = os.path.join(RAW_DIR, "raw_chadwick.csv")
+    if not os.path.exists(chadwick_path):
+        print("  Pulling Chadwick Bureau register...")
+        try:
+            chad = pyb.chadwick_register()
+            chad = chad[["key_mlbam", "key_fangraphs"]].dropna()
+            chad["key_mlbam"]     = chad["key_mlbam"].astype(int)
+            chad["key_fangraphs"] = chad["key_fangraphs"].astype(int)
+            chad.to_csv(chadwick_path, index=False)
+            print(f"    Saved {len(chad):,} rows → {chadwick_path}")
+        except Exception as e:
+            print(f"    WARNING: Chadwick pull failed — {e}; using MLBAM as IDfg fallback")
+            chad = pd.DataFrame(columns=["key_mlbam", "key_fangraphs"])
+    else:
+        chad = pd.read_csv(chadwick_path, low_memory=False)
+        chad["key_mlbam"]     = pd.to_numeric(chad["key_mlbam"],     errors="coerce")
+        chad["key_fangraphs"] = pd.to_numeric(chad["key_fangraphs"], errors="coerce")
+        chad = chad.dropna()
+
+    mlbam_to_fg = (chad.drop_duplicates("key_mlbam")
+                       .set_index("key_mlbam")["key_fangraphs"]
+                       .to_dict())
+
+    splits["key_mlbam"] = splits["batter"].astype(int)
+    splits["IDfg"] = splits["key_mlbam"].map(mlbam_to_fg)
+    # Fallback: use MLBAM ID as IDfg when FGid unknown (keeps batter in training)
+    splits["IDfg"] = splits["IDfg"].fillna(splits["key_mlbam"])
+    splits["IDfg"] = splits["IDfg"].astype(int)
+
+    out_cols = ["IDfg", "key_mlbam", "season", "wRC+", "OBP", "ISO", "K%", "BB%"]
+
+    df_lhp = splits[splits["p_throws"] == "L"][out_cols].reset_index(drop=True)
+    df_rhp = splits[splits["p_throws"] == "R"][out_cols].reset_index(drop=True)
 
     df_lhp.to_csv(lhp_path, index=False)
     df_rhp.to_csv(rhp_path, index=False)
-    print(f"    LHP splits: {len(df_lhp):,} rows | RHP splits: {len(df_rhp):,} rows")
+    print(f"    LHP splits: {len(df_lhp):,} batters | RHP splits: {len(df_rhp):,} batters")
     return df_lhp, df_rhp
 
 
