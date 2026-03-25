@@ -52,8 +52,19 @@ AUTH_TOKEN = ""   # <-- PASTE YOUR ACTION NETWORK SESSION TOKEN HERE
 # In R: Sys.setenv(AN_TOKEN = "your_token_here")
 AUTH_TOKEN = AUTH_TOKEN or os.environ.get("AN_TOKEN", "")
 
-# Action Network internal API base URL
-BASE_URL = "https://api.actionnetwork.com/web/v1"
+# Action Network internal API base URLs
+BASE_URL   = "https://api.actionnetwork.com/web/v1"
+BASE_URL_V2 = "https://api.actionnetwork.com/web/v2"
+
+# Mapping from our prop_type names to v2 player_props dict keys
+V2_PROP_TYPE_MAP = {
+    "batter_total_bases":    "core_bet_type_77_total_bases",
+    "pitcher_outs_recorded": "core_bet_type_42_pitching_outs",
+    # NRFI/YRFI is a game-level market — not in player_props; handled separately
+    "nrfi":                  None,
+    "first_inning_score":    None,
+    "first_1_innings_score": None,
+}
 
 # Book IDs for consensus odds (Action Network internal IDs)
 # These are the major US sportsbooks
@@ -446,7 +457,7 @@ def _parse_game_odds(game: dict) -> dict:
 def fetch_player_props(game_id: str, prop_type: str = "batter_total_bases",
                         token: str = None) -> pd.DataFrame:
     """
-    Fetch player prop lines from Action Network for a specific game.
+    Fetch player prop lines from Action Network for a specific game (v2 API).
 
     Requires Action Network PRO subscription and valid auth token.
 
@@ -455,12 +466,10 @@ def fetch_player_props(game_id: str, prop_type: str = "batter_total_bases",
     game_id : str
         Action Network's internal game ID (from fetch_mlb_odds output).
     prop_type : str
-        Type of prop to fetch. Known types:
+        Type of prop to fetch. Supported types:
           - "batter_total_bases"    : Hitter total bases O/U
           - "pitcher_outs_recorded" : Pitcher outs recorded O/U
-          - "batter_hits"           : Hitter hits O/U
-          - "pitcher_strikeouts"    : Pitcher K total O/U
-          - "batter_home_runs"      : HR props (alt lines)
+          - "nrfi" / "first_inning_score" : NRFI/YRFI (game-level, if available)
     token : str, optional
         Override module-level AUTH_TOKEN.
 
@@ -469,118 +478,101 @@ def fetch_player_props(game_id: str, prop_type: str = "batter_total_bases",
     pd.DataFrame
         One row per player-line with:
           player_name, team, prop_line, over_juice, under_juice,
-          prop_type, game_id, book_name
-
-    Notes
-    -----
-    The exact endpoint path for props may be:
-      /games/{game_id}/props
-      /props/mlb/{game_id}
-      /events/{game_id}/player-props
-    We try multiple paths and return whichever works.
+          prop_type, book_name
     """
     if not (AUTH_TOKEN or token or _load_token_from_file()):
         print("  ERROR: Props require AUTH_TOKEN. See module docstring for setup.")
         return pd.DataFrame()
 
     session = build_session(token)
+    url     = f"{BASE_URL_V2}/games/{game_id}/props"
 
-    # Try multiple endpoint patterns (AN has changed these historically)
-    prop_endpoints = [
-        f"{BASE_URL}/games/{game_id}/props",
-        f"{BASE_URL}/props/mlb/{game_id}",
-        f"{BASE_URL}/events/{game_id}/player-props",
-        f"{BASE_URL}/scoreboard/mlb/{game_id}/player-props",
-    ]
+    try:
+        resp = session.get(url, timeout=15)
+        if resp.status_code == 401:
+            print("  ERROR: 401 Unauthorized — token expired or invalid.")
+            return pd.DataFrame()
+        if resp.status_code != 200:
+            print(f"  WARNING: No props endpoint responded for game {game_id}.")
+            return pd.DataFrame()
+        data = resp.json()
+    except Exception as e:
+        print(f"  WARNING: Props request failed for game {game_id}: {e}")
+        return pd.DataFrame()
 
-    data = None
-    for endpoint in prop_endpoints:
-        try:
-            params = {"type": prop_type} if prop_type else {}
-            resp   = session.get(endpoint, params=params, timeout=15)
-            if resp.status_code == 200:
-                data = resp.json()
-                print(f"  ✓ Props endpoint: {endpoint}")
-                break
-            elif resp.status_code == 404:
-                continue  # Try next endpoint
-            elif resp.status_code == 401:
-                print("  ERROR: 401 Unauthorized — token expired or invalid.")
-                return pd.DataFrame()
-        except Exception as e:
+    players_map = data.get("players", {})
+
+    # Map our prop_type name to the v2 player_props key
+    v2_key = V2_PROP_TYPE_MAP.get(prop_type)
+    if v2_key:
+        entries = data.get("player_props", {}).get(v2_key, [])
+    else:
+        # Game-level markets (NRFI/YRFI) live in game_props
+        entries = []
+        for gp_entries in data.get("game_props", {}).values():
+            entries.extend(gp_entries if isinstance(gp_entries, list) else [])
+
+    if not entries:
+        return pd.DataFrame()
+
+    return _parse_props_v2(entries, players_map, prop_type)
+
+
+def _parse_props_v2(entries: list, players_map: dict, prop_type: str) -> pd.DataFrame:
+    """
+    Parse v2 props response into a standardized DataFrame.
+
+    v2 structure per entry:
+      - player_id  : int
+      - lines      : {book_id: [{side, value, odds, ...}, ...]}
+    players_map    : {player_id: {full_name, display_text, ...}}
+
+    Returns one row per (player, prop_line) with consensus over/under juice.
+    """
+    from collections import defaultdict
+
+    # {player_id: {line_value: {"over": [odds,...], "under": [odds,...]}}}
+    player_lines = defaultdict(lambda: defaultdict(lambda: {"over": [], "under": []}))
+
+    for entry in entries:
+        player_id = entry.get("player_id")
+        if not player_id:
             continue
-
-    if data is None:
-        print(f"  WARNING: No props endpoint responded for game {game_id}.")
-        print("  The exact props URL may have changed — check AN DevTools network tab.")
-        return pd.DataFrame()
-
-    # --- Parse props response ------------------------------------------------
-    props_raw = data.get("props", data.get("player_props", data.get("data", [])))
-    if not props_raw:
-        print(f"  WARNING: No props in response. Keys: {list(data.keys())}")
-        return pd.DataFrame()
+        for book_lines in entry.get("lines", {}).values():
+            if not isinstance(book_lines, list):
+                continue
+            for line in book_lines:
+                value = line.get("value")
+                side  = str(line.get("side", "")).lower()
+                odds  = line.get("odds")
+                if value is None or odds is None or side not in ("over", "under"):
+                    continue
+                player_lines[player_id][float(value)][side].append(float(odds))
 
     records = []
-    for prop in props_raw:
-        try:
-            record = _parse_prop(prop)
-            if record:
-                records.append(record)
-        except Exception as e:
-            pass
+    for player_id, line_data in player_lines.items():
+        player_info  = players_map.get(str(player_id)) or players_map.get(player_id) or {}
+        player_name  = player_info.get("full_name", "Unknown")
+        display_text = player_info.get("display_text", "")  # e.g. "NYY - DH"
+        team         = display_text.split(" - ")[0] if " - " in display_text else ""
 
-    if not records:
-        print("  WARNING: Could not parse props. Raw structure:")
-        if props_raw:
-            print(json.dumps(props_raw[0], indent=2)[:1000])
-        return pd.DataFrame()
+        for line_val, sides in line_data.items():
+            over_odds  = sides["over"]
+            under_odds = sides["under"]
+            if not over_odds and not under_odds:
+                continue
 
-    return pd.DataFrame(records)
+            records.append({
+                "player_name":  player_name,
+                "team":         team,
+                "prop_type":    prop_type,
+                "prop_line":    line_val,
+                "over_juice":   float(np.median(over_odds))  if over_odds  else -110.0,
+                "under_juice":  float(np.median(under_odds)) if under_odds else -110.0,
+                "book_name":    "Consensus",
+            })
 
-
-def _parse_prop(prop: dict) -> dict:
-    """Parse a single prop offer from Action Network response."""
-    def safe_get(d, *keys):
-        for k in keys:
-            if isinstance(d, dict) and k in d:
-                return d[k]
-        return None
-
-    player = safe_get(prop, "player", "athlete") or {}
-    player_name = (
-        safe_get(player, "full_name", "name", "display_name")
-        or safe_get(prop, "player_name", "name")
-        or "Unknown"
-    )
-    team = (
-        safe_get(player, "team", "team_abbr")
-        or safe_get(prop, "team")
-        or ""
-    )
-    if isinstance(team, dict):
-        team = safe_get(team, "abbr", "abbreviation", "short_name") or ""
-
-    team = AN_TEAM_MAP.get(team, team)
-
-    line      = safe_get(prop, "line", "total", "prop_line", "value")
-    over_odds = safe_get(prop, "over_odds", "over_price", "over")
-    under_odds= safe_get(prop, "under_odds", "under_price", "under")
-    book_name = safe_get(prop, "book", "book_name", "sportsbook") or "Consensus"
-    prop_type = safe_get(prop, "prop_type", "type", "market_name") or ""
-
-    if line is None:
-        return None
-
-    return {
-        "player_name":  str(player_name),
-        "team":         str(team),
-        "prop_type":    str(prop_type),
-        "prop_line":    float(line),
-        "over_juice":   float(over_odds) if over_odds is not None else -110.0,
-        "under_juice":  float(under_odds) if under_odds is not None else -110.0,
-        "book_name":    str(book_name),
-    }
+    return pd.DataFrame(records) if records else pd.DataFrame()
 
 
 # =============================================================================
