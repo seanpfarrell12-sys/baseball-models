@@ -41,6 +41,7 @@ Output : data/processed/hitter_tb_dataset.csv
 """
 
 import os
+import json
 import warnings
 import numpy as np
 import pandas as pd
@@ -100,6 +101,16 @@ def load_raw() -> dict:
     raw["pit_arsenal"]   = _load("Pitcher arsenal",       "pitcher_arsenal")
     raw["pit_exp"]       = _load("Pitcher expected",      "pitcher_expected")
 
+    pf_path = os.path.join(RAW_DIR, "park_factors.json")
+    if os.path.exists(pf_path):
+        with open(pf_path) as f:
+            pf_raw = json.load(f)
+        raw["park_hr"] = {team: v.get("pf_hr", 100) for team, v in pf_raw.items()}
+        print(f"    Park HR factors: {len(raw['park_hr'])} teams loaded")
+    else:
+        raw["park_hr"] = {}
+        print("    WARNING: park_factors.json not found — park_pf_hr will be 100")
+
     frames = []
     for yr in GAME_YEARS:
         path = os.path.join(RAW_DIR, f"raw_retrosheet_{yr}.csv")
@@ -151,7 +162,7 @@ def build_batter_features(bat_exp: pd.DataFrame,
     EXP_COLS = ["key_mlbam", "season", "est_ba", "est_slg", "est_woba"]
     EV_COLS  = ["key_mlbam", "season",
                 "exit_velocity_avg", "launch_angle_avg",
-                "barrel_batted_rate", "hard_hit_percent"]
+                "barrel_batted_rate", "hard_hit_percent", "sweet_spot_pct"]
 
     def _norm(df, cols):
         keep = [c for c in cols if c in df.columns]
@@ -178,7 +189,7 @@ def build_batter_features(bat_exp: pd.DataFrame,
                             if k in merged.columns}, inplace=True)
 
     feat_cols = ["xba", "xslg", "xwoba", "ev_avg", "la_avg",
-                 "barrel_pct", "hard_hit_pct"]
+                 "barrel_pct", "hard_hit_pct", "sweet_spot_pct"]
     for col in feat_cols:
         if col not in merged.columns:
             merged[col] = np.nan
@@ -370,13 +381,14 @@ def extract_batting_orders(retro: pd.DataFrame,
             bat_col = f"h_bat_{slot}_id"
             if bat_col in game.index and pd.notna(game[bat_col]):
                 rows.append({
-                    "game_date":    gdate,
-                    "season":       season,
-                    "team_retro":   home_retro,
-                    "batter_retro": str(game[bat_col]),
-                    "batting_slot": slot,
-                    "sp_retro":     v_sp,
-                    "home_flag":    1,
+                    "game_date":      gdate,
+                    "season":         season,
+                    "team_retro":     home_retro,
+                    "home_team_retro":home_retro,
+                    "batter_retro":   str(game[bat_col]),
+                    "batting_slot":   slot,
+                    "sp_retro":       v_sp,
+                    "home_flag":      1,
                 })
 
         # Away batters face home SP (h_sp)
@@ -384,13 +396,14 @@ def extract_batting_orders(retro: pd.DataFrame,
             bat_col = f"v_bat_{slot}_id"
             if bat_col in game.index and pd.notna(game[bat_col]):
                 rows.append({
-                    "game_date":    gdate,
-                    "season":       season,
-                    "team_retro":   away_retro,
-                    "batter_retro": str(game[bat_col]),
-                    "batting_slot": slot,
-                    "sp_retro":     h_sp,
-                    "home_flag":    0,
+                    "game_date":      gdate,
+                    "season":         season,
+                    "team_retro":     away_retro,
+                    "home_team_retro":home_retro,
+                    "batter_retro":   str(game[bat_col]),
+                    "batting_slot":   slot,
+                    "sp_retro":       h_sp,
+                    "home_flag":      0,
                 })
 
     print(f"    Extracted {len(rows):,} batter-game appearances from retrosheet")
@@ -482,14 +495,19 @@ def build_dataset(raw: dict) -> pd.DataFrame:
     df = pd.DataFrame(batting_rows)
 
     # Map retro IDs → MLBAM
-    df["batter_mlbam"] = df["batter_retro"].map(retro_to_mlbam)
-    df["sp_mlbam"]     = df["sp_retro"].map(retro_to_mlbam)
-    df["team"]         = df["team_retro"].map(RETRO_TO_STD).fillna(df["team_retro"])
-    df["pa_proj"]      = df["batting_slot"].map(SLOT_PA_PROJ)
+    df["batter_mlbam"]   = df["batter_retro"].map(retro_to_mlbam)
+    df["sp_mlbam"]       = df["sp_retro"].map(retro_to_mlbam)
+    df["team"]           = df["team_retro"].map(RETRO_TO_STD).fillna(df["team_retro"])
+    df["home_team_std"]  = df["home_team_retro"].map(RETRO_TO_STD).fillna(df["home_team_retro"])
+    df["pa_proj"]        = df["batting_slot"].map(SLOT_PA_PROJ)
+
+    # Park HR factor (higher = more HR-friendly park = more TB opportunity)
+    park_hr = raw.get("park_hr", {})
+    df["park_pf_hr"] = df["home_team_std"].map(park_hr).fillna(100).astype(float)
 
     # ── Batter features (prior-year Statcast) ─────────────────────────────
     bat_feat_cols = ["xba", "xslg", "xwoba", "ev_avg", "la_avg",
-                     "barrel_pct", "hard_hit_pct"]
+                     "barrel_pct", "hard_hit_pct", "sweet_spot_pct"]
     for col in bat_feat_cols:
         df[col] = np.nan
 

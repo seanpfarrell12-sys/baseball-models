@@ -126,6 +126,7 @@ def load_raw() -> dict:
     raw["team_bat"] = _load("Team batting",            "raw_team_batting_opp.csv")
     raw["mgr"]      = _load("Manager removal stats",  "raw_manager_removal_stats.csv")
     raw["mgr_pri"]  = _load("Manager priors",         "raw_manager_priors.csv")
+    raw["pit_eff"]  = _load("Pitcher efficiency",     "raw_pitcher_efficiency.csv")
 
     frames = []
     for yr in GAME_YEARS:
@@ -369,6 +370,56 @@ def build_opponent_lookup(team_bat: pd.DataFrame) -> dict:
 
 
 # =============================================================================
+# BUILD BULLPEN WORKLOAD LOOKUP  keyed by (team, season)
+# =============================================================================
+def build_bullpen_workload(pit_eff: pd.DataFrame) -> dict:
+    """
+    Compute team-season bullpen workload proxies from pitcher efficiency data.
+
+    Features:
+      bp_gmLI         : mean game-entry leverage index for relievers
+                        (higher = bullpen used more in high-leverage spots)
+      bp_total_apps   : total relief appearances (proxy for usage/fatigue)
+
+    Manager context: if bullpen is overworked (high gmLI, high appearances),
+    the manager may leave the SP in slightly longer to protect key arms.
+    """
+    bp_workload = {}
+    if pit_eff.empty:
+        return bp_workload
+
+    eff = pit_eff.copy()
+    if "Season" in eff.columns:
+        eff = eff.rename(columns={"Season": "season"})
+
+    gs_col = "GS" if "GS" in eff.columns else None
+    rp = eff[(pd.to_numeric(eff[gs_col], errors="coerce").fillna(0) < 5)].copy() \
+         if gs_col else eff.copy()
+
+    team_col = next((c for c in ["Team", "Tm", "team"] if c in rp.columns), None)
+    if team_col:
+        rp["team_std"] = rp[team_col].map(FG_TO_STD).fillna(rp[team_col])
+    else:
+        return bp_workload
+
+    for (team, season), grp in rp.groupby(["team_std", "season"]):
+        entry = {}
+        if "gmLI" in grp.columns:
+            gmli = pd.to_numeric(grp["gmLI"], errors="coerce").dropna()
+            if not gmli.empty:
+                entry["bp_gmLI"] = float(gmli.mean())
+        if "G" in grp.columns:
+            entry["bp_total_apps"] = float(
+                pd.to_numeric(grp["G"], errors="coerce").sum()
+            )
+        if entry:
+            bp_workload[(team, int(season))] = entry
+
+    print(f"    Bullpen workload lookup: {len(bp_workload):,} (team, season) entries")
+    return bp_workload
+
+
+# =============================================================================
 # EXTRACT PER-START SP DATA FROM RETROSHEET
 # =============================================================================
 def extract_per_start_data(retro: pd.DataFrame,
@@ -431,7 +482,8 @@ def extract_per_start_data(retro: pd.DataFrame,
 def build_per_start_dataset(starts: list,
                               sp_lookup: dict,
                               manager_lookup: dict,
-                              opp_lookup: dict) -> pd.DataFrame:
+                              opp_lookup: dict,
+                              bp_workload: dict = None) -> pd.DataFrame:
     """
     Assembles one row per SP start with:
       - Prior-year SP features (key: (sp_mlbam, season-1))
@@ -467,6 +519,11 @@ def build_per_start_dataset(starts: list,
                 mgr_feat = manager_lookup.get((team, s), {})
                 if mgr_feat:
                     break
+
+        # Bullpen workload features (prior-year, SP's team)
+        bp_feat = (bp_workload or {}).get((team, int(season) - 1), {})
+        if not bp_feat:
+            bp_feat = (bp_workload or {}).get((team, int(season)), {})
 
         # Opponent features (for training use league averages since we track home/away)
         # In scoring, the actual opponent is passed in
@@ -544,6 +601,11 @@ def build_per_start_dataset(starts: list,
                                    * float(mgr_feat.get("depth_score", 0.52)),
             # Pitch count pressure at TTOP: does SP have pitch count room at BF18?
             "pc_headroom_at_ttop": max(0.0, typical_pc_limit - est_pc_at_bf18),
+
+            # Bullpen workload (high gmLI = bullpen used in more leverage → fatigue)
+            # A fatigued bullpen may push manager to leave SP in longer.
+            "bp_gmLI":             float(bp_feat.get("bp_gmLI",         1.0)),
+            "bp_total_apps":       float(bp_feat.get("bp_total_apps", 450.0)),
         }
 
         # Censoring: complete game or near-CG (manager's choice doesn't apply)
@@ -708,23 +770,26 @@ if __name__ == "__main__":
     print("PITCHER TOTAL OUTS MODEL — STEP 2: FEATURE ENGINEERING (SURVIVAL)")
     print("=" * 70)
 
-    print("\n[ 1/6 ] Loading raw data...")
+    print("\n[ 1/7 ] Loading raw data...")
     raw = load_raw()
 
-    print("\n[ 2/6 ] Building ID maps...")
+    print("\n[ 2/7 ] Building ID maps...")
     retro_to_mlbam, mlbam_to_fg = build_id_maps(raw["chad"])
 
-    print("\n[ 3/6 ] Building SP feature lookup (prior-year Statcast + FG)...")
+    print("\n[ 3/7 ] Building SP feature lookup (prior-year Statcast + FG)...")
     sp_lookup = build_sp_feature_lookup(raw["fg_pit"], raw["sc_exp"],
                                          raw["ars"], mlbam_to_fg)
 
-    print("\n[ 4/6 ] Building manager hazard lookup...")
+    print("\n[ 4/7 ] Building manager hazard lookup...")
     manager_lookup = build_manager_hazard_lookup(raw["mgr"], raw["mgr_pri"])
 
-    print("\n[ 5/6 ] Building opponent lookup (walk rates)...")
+    print("\n[ 5/7 ] Building opponent lookup (walk rates)...")
     opp_lookup = build_opponent_lookup(raw["team_bat"])
 
-    print("\n[ 6/6 ] Assembling per-start dataset + BF-level expansion...")
+    print("\n[ 6/7 ] Building bullpen workload lookup...")
+    bp_workload = build_bullpen_workload(raw["pit_eff"])
+
+    print("\n[ 7/7 ] Assembling per-start dataset + BF-level expansion...")
     print("  Extracting per-start data from retrosheet logs...")
     starts = extract_per_start_data(raw["retro"], retro_to_mlbam)
 
@@ -732,7 +797,8 @@ if __name__ == "__main__":
         print("  ERROR: No starts extracted from retrosheet. Check retrosheet data.")
         exit(1)
 
-    starts_df = build_per_start_dataset(starts, sp_lookup, manager_lookup, opp_lookup)
+    starts_df = build_per_start_dataset(starts, sp_lookup, manager_lookup,
+                                         opp_lookup, bp_workload)
     starts_df = impute_outs_from_fg_averages(starts_df, sp_lookup)
 
     # Drop starts still missing outs (can't train without target)

@@ -173,6 +173,19 @@ def load_park_meta() -> tuple:
     return data.get("stadium_meta", {}), data.get("park_hr_factors", {})
 
 
+def load_ump_data() -> pd.DataFrame:
+    """Load pre-pulled UmpScorecards game-level umpire accuracy data."""
+    path = os.path.join(RAW_DIR, "raw_ump_scorecards.csv")
+    if not os.path.exists(path):
+        print("  WARNING: raw_ump_scorecards.csv not found — "
+              "umpire features will be null (run 01_input_nrfi.py first)")
+        return pd.DataFrame()
+    df = pd.read_csv(path, low_memory=False)
+    df["game_pk"] = pd.to_numeric(df["game_pk"], errors="coerce")
+    print(f"  Ump scorecards loaded: {len(df):,} games")
+    return df
+
+
 def load_chadwick() -> pd.DataFrame:
     """Chadwick register: key_mlbam ↔ key_fangraphs ↔ key_retro bridge."""
     path = os.path.join(RAW_DIR, "raw_chadwick.csv")
@@ -354,10 +367,31 @@ def build_sp_first_inning_stats(sc: pd.DataFrame) -> pd.DataFrame:
         whiff_agg = pa_agg[["key_mlbam", "season"]].copy()
         whiff_agg["fi_whiff_pct"] = np.nan
 
+    # ── First-pitch strike rate ───────────────────────────────────────────────
+    # A first-pitch strike (called, swinging, or in-play) is a strong predictor
+    # of PA outcomes: pitchers who throw more first-pitch strikes induce more
+    # grounders and fewer walks in the first inning.
+    if "pitch_number" in sc.columns and "type" in sc.columns:
+        fp = sc[sc["pitch_number"] == 1].copy()
+        # type: 'S' = strike (called/swinging/foul), 'X' = ball in play (also a strike)
+        fp["is_fp_strike"] = fp["type"].isin(["S", "X"]).astype(int)
+        fp_agg = (fp.groupby(["key_mlbam", "season"])
+                  .agg(
+                      fp_total  = ("pitch_number", "count"),
+                      fp_strike = ("is_fp_strike", "sum"),
+                  ).reset_index())
+        fp_agg["fi_fstrike_pct"] = (fp_agg["fp_strike"] /
+                                    fp_agg["fp_total"].clip(lower=1))
+        fp_agg = fp_agg[["key_mlbam", "season", "fi_fstrike_pct"]]
+    else:
+        fp_agg = pa_agg[["key_mlbam", "season"]].copy()
+        fp_agg["fi_fstrike_pct"] = np.nan
+
     # ── Combine ───────────────────────────────────────────────────────────────
     sp_stats = (per_game_runs
                 .merge(pa_agg,    on=["key_mlbam", "season"], how="left")
-                .merge(whiff_agg, on=["key_mlbam", "season"], how="left"))
+                .merge(whiff_agg, on=["key_mlbam", "season"], how="left")
+                .merge(fp_agg,    on=["key_mlbam", "season"], how="left"))
 
     sp_stats["fi_pa"]       = sp_stats["fi_pa"].fillna(0)
     sp_stats["fi_gs"]       = sp_stats["fi_gs"].fillna(1).clip(lower=1)
@@ -372,7 +406,7 @@ def build_sp_first_inning_stats(sc: pd.DataFrame) -> pd.DataFrame:
     keep_cols = ["key_mlbam", "season",
                  "fi_gs", "fi_pa", "fi_era",
                  "fi_k_pct", "fi_bb_pct", "fi_hr_per_9",
-                 "fi_hits_per_9", "fi_whiff_pct"]
+                 "fi_hits_per_9", "fi_whiff_pct", "fi_fstrike_pct"]
     sp_stats = sp_stats[[c for c in keep_cols if c in sp_stats.columns]]
     print(f"  SP first-inning stats: {len(sp_stats):,} pitcher-season rows")
     return sp_stats
@@ -961,35 +995,48 @@ def build_nrfi_dataset(game_years: list = GAME_YEARS) -> pd.DataFrame:
     stadium_meta, park_hr_factors = load_park_meta()
 
     # ── Step 1: YRFI labels + SP IDs ──────────────────────────────────────────
-    print("\n[ 1/7 ] Building YRFI game index from Statcast...")
+    print("\n[ 1/8 ] Building YRFI game index from Statcast...")
     games = build_yrfi_game_index(sc)
 
+    # ── Ump data join (by game_pk) ─────────────────────────────────────────────
+    print("\n[ Ump ] Joining umpire accuracy data...")
+    ump_df = load_ump_data()
+    if not ump_df.empty and "game_pk" in games.columns:
+        ump_keep = [c for c in ["game_pk", "ump_overall_accuracy",
+                                "ump_total_run_impact", "ump_favor"]
+                    if c in ump_df.columns]
+        if len(ump_keep) > 1:
+            games = games.merge(ump_df[ump_keep], on="game_pk", how="left")
+            cov = games["ump_overall_accuracy"].notna().mean() \
+                  if "ump_overall_accuracy" in games.columns else 0
+            print(f"    Ump coverage: {cov:.1%}")
+
     # ── Step 2: SP first-inning stats ─────────────────────────────────────────
-    print("\n[ 2/7 ] Building SP first-inning aggregate stats...")
+    print("\n[ 2/8 ] Building SP first-inning aggregate stats...")
     sp_fi = build_sp_first_inning_stats(sc)
 
     # ── Step 3: FG Stuff+/Location+ ───────────────────────────────────────────
-    print("\n[ 3/7 ] Building FanGraphs SP quality features...")
+    print("\n[ 3/8 ] Building FanGraphs SP quality features...")
     sp_fg = build_sp_fg_features(fg, chad)
 
     # ── Step 4: Join SP features ──────────────────────────────────────────────
-    print("\n[ 4/7 ] Joining SP features to game index (prior-year)...")
+    print("\n[ 4/8 ] Joining SP features to game index (prior-year)...")
     games = join_sp_features(games, sp_fi, sp_fg)
 
     # ── Step 5: Top-3 lineup extraction ───────────────────────────────────────
-    print("\n[ 5/7 ] Extracting top-3 lineup slots from retrosheet...")
+    print("\n[ 5/8 ] Extracting top-3 lineup slots from retrosheet...")
     lu    = extract_top3_lineups(retro, chad)
 
     # ── Step 6: Platoon batting splits ────────────────────────────────────────
-    print("\n[ 6/7 ] Building top-3 platoon batting features...")
+    print("\n[ 6/8 ] Building top-3 platoon batting features...")
     games = build_top3_features(games, lu, lhp, rhp, chad)
 
     # ── Step 7: Environmental features ───────────────────────────────────────
-    print("\n[ 7/7 ] Building environmental (weather + park) features...")
+    print("\n[ 7/8 ] Building environmental (weather + park) features...")
     games = build_environmental_features(games, wx, stadium_meta, park_hr_factors)
 
-    # ── Impute + finalise ─────────────────────────────────────────────────────
-    print("\n[ Final ] Imputing missing values and computing interactions...")
+    # ── Step 8: Impute + finalise ─────────────────────────────────────────────
+    print("\n[ 8/8 ] Imputing missing values and computing interactions...")
     games = impute_and_finalise(games)
 
     # ── Save ──────────────────────────────────────────────────────────────────

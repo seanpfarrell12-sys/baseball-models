@@ -471,6 +471,67 @@ def pull_historical_weather_nrfi(game_years: list) -> pd.DataFrame:
 
 
 # =============================================================================
+# 5. UMPIRE STRIKE-ZONE ACCURACY (UmpScorecards API)
+# =============================================================================
+def pull_ump_scorecards(game_years: list) -> pd.DataFrame:
+    """
+    Pull umpire strike-zone accuracy data from the UmpScorecards API.
+    Returns per-game umpire metrics: overall_accuracy, favor, total_run_impact.
+    Saves to data/raw/raw_ump_scorecards.csv.
+
+    Endpoint: https://umpscorecards.com/api/games/?year={yr}
+    Columns returned: game_pk, umpire, overall_accuracy, favor,
+                      total_run_impact, consistency
+    """
+    out_path = os.path.join(RAW_DIR, "raw_ump_scorecards.csv")
+    if os.path.exists(out_path):
+        existing = pd.read_csv(out_path)
+        print(f"    Umpire data: loading from cache ({len(existing):,} rows)")
+        return existing
+
+    UMP_URL = "https://umpscorecards.com/api/games/"
+    all_frames = []
+    for yr in game_years:
+        print(f"  Pulling UmpScorecards for {yr}...")
+        try:
+            r = requests.get(UMP_URL, params={"year": yr}, timeout=60)
+            r.raise_for_status()
+            data = r.json()
+            # API returns {"rows": [...]} or bare list
+            rows = data.get("rows", data) if isinstance(data, dict) else data
+            if rows:
+                df = pd.DataFrame(rows)
+                df["season"] = yr
+                all_frames.append(df)
+                print(f"    {yr}: {len(df):,} games (raw pull)")
+            time.sleep(1)
+        except Exception as e:
+            print(f"    WARNING: UmpScorecards {yr} — {e}")
+
+    if not all_frames:
+        print("  WARNING: No umpire data collected")
+        return pd.DataFrame()
+
+    ump = pd.concat(all_frames, ignore_index=True)
+    # API returns all historical years regardless of year param; deduplicate
+    if "date" in ump.columns:
+        ump["_year"] = pd.to_datetime(ump["date"], errors="coerce").dt.year
+        ump = ump[ump["_year"].isin(game_years)].drop(columns=["_year"])
+    ump = ump.drop_duplicates(subset="game_pk") if "game_pk" in ump.columns else ump
+    rename = {
+        "overall_accuracy":  "ump_overall_accuracy",
+        "favor":             "ump_favor",
+        "total_run_impact":  "ump_total_run_impact",
+        "consistency":       "ump_consistency",
+    }
+    ump.rename(columns={k: v for k, v in rename.items() if k in ump.columns},
+               inplace=True)
+    ump.to_csv(out_path, index=False)
+    print(f"  ✓ Saved raw_ump_scorecards.csv ({len(ump):,} rows)")
+    return ump
+
+
+# =============================================================================
 # MAIN
 # =============================================================================
 if __name__ == "__main__":
@@ -478,17 +539,20 @@ if __name__ == "__main__":
     print("NRFI / YRFI MODEL — STEP 1: DATA INPUT")
     print("=" * 70)
 
-    print("\n[ 1/4 ] Statcast first-inning data (YRFI labels + 1st-inn SP stats)...")
+    print("\n[ 1/5 ] Statcast first-inning data (YRFI labels + 1st-inn SP stats)...")
     pull_first_inning_statcast(GAME_YEARS)
 
-    print("\n[ 2/4 ] FanGraphs pitching stats (Stuff+, Location+, K%, BB%)...")
+    print("\n[ 2/5 ] FanGraphs pitching stats (Stuff+, Location+, K%, BB%)...")
     pull_fg_pitching_nrfi(STAT_YEARS)
 
-    print("\n[ 3/4 ] Batting platoon splits (vs LHP / vs RHP)...")
+    print("\n[ 3/5 ] Batting platoon splits (vs LHP / vs RHP)...")
     pull_batting_splits_nrfi(STAT_YEARS)
 
-    print("\n[ 4/4 ] Historical weather (Open-Meteo)...")
+    print("\n[ 4/5 ] Historical weather (Open-Meteo)...")
     pull_historical_weather_nrfi(GAME_YEARS)
+
+    print("\n[ 5/5 ] Umpire strike-zone accuracy (UmpScorecards API)...")
+    pull_ump_scorecards(GAME_YEARS)
 
     import json
     meta_path = os.path.join(RAW_DIR, "raw_nrfi_park_meta.json")

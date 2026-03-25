@@ -24,7 +24,31 @@
       "Bash(git init:*)",
       "Bash(git add:*)",
       "Bash(git rm:*)",
-      "Bash(git commit:*)"
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "Bash(grep -v warnings python3 -c \":*)",
+      "Bash(head -20 grep -n \"lineup\\\\|get_lineups\\\\|confirmed\\\\|batting_order\" /Users/seanfarrell/baseball_models/moneyline/04_export_moneyline.py)",
+      "Bash(head -10 grep -n \"lineup\\\\|get_lineups\\\\|confirmed\\\\|batting_order\" /Users/seanfarrell/baseball_models/pitcher_outs/04_export_pitcher_outs.py)",
+      "Bash(head -10 grep -n \"lineup\\\\|get_lineups\\\\|confirmed\\\\|batting_order\" /Users/seanfarrell/baseball_models/totals/04_export_totals.py)",
+      "Bash(head -20 grep -A3 \"confirmed.*lineup\\\\|lineup.*confirmed\\\\|src == .confirmed\\\\|!= .confirmed\" /Users/seanfarrell/baseball_models/nrfi/04_export_nrfi.py)",
+      "Bash(/tmp/check_models.txt:*)",
+      "Read(//tmp/**)",
+      "Bash(grep:*)",
+      "Bash(__NEW_LINE_eb6e3315c4b88a14__ echo:*)",
+      "Bash(head -5 grep -n \"MODEL_DIR\\\\|models\" /Users/seanfarrell/baseball_models/totals/04_export_totals.py)",
+      "Bash(head -5 grep -n \"MODEL_DIR\\\\|import pandas\\\\|^import\\\\|^from\" /Users/seanfarrell/baseball_models/run_daily.py)",
+      "Bash(head -5 grep -n \"MODEL_DIR\\\\|models\" /Users/seanfarrell/baseball_models/pitcher_outs/04_export_pitcher_outs.py)",
+      "Bash(head -5 grep -n \"import pandas\\\\|pd\\\\.\" /Users/seanfarrell/baseball_models/run_daily.py)",
+      "Bash(for script:*)",
+      "Bash(do echo \"=== $script ===\" python3 -c \":*)",
+      "Bash(head -5 grep -n \"^def load_model\\\\|^def load_\\\\|^def run_\" /Users/seanfarrell/baseball_models/totals/04_export_totals.py)",
+      "Bash(head -5 grep -n \"^def load_model\\\\|^def load_\\\\|^def run_\" /Users/seanfarrell/baseball_models/hitter_tb/04_export_hitter_tb.py)",
+      "Bash(head -5 grep -n \"^def load_model\\\\|^def load_\\\\|^def run_\" /Users/seanfarrell/baseball_models/pitcher_outs/04_export_pitcher_outs.py)",
+      "Bash(head -5 grep -n \"model.load_model\\\\|joblib.load\\\\|pickle.load\\\\|open.*model\" /Users/seanfarrell/baseball_models/totals/04_export_totals.py)",
+      "Bash(head -5 grep -n \"MODEL_DIR\\\\|models\" /Users/seanfarrell/baseball_models/totals/03_analysis_totals.py)",
+      "Bash(head -5 grep -n \"MODEL_DIR\\\\|models\" /Users/seanfarrell/baseball_models/hitter_tb/03_analysis_hitter_tb.py)",
+      "Bash(head -5 grep -n \"MODEL_DIR\\\\|models\" /Users/seanfarrell/baseball_models/pitcher_outs/03_analysis_pitcher_outs.py)",
+      "Bash(do echo:*)"
     ]
   }
 }

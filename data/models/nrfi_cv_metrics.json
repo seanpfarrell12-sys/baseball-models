@@ -1,0 +1,29 @@
+{
+  "train_2023-2023_eval_2024": {
+    "train_seasons": [
+      2023
+    ],
+    "eval_season": 2024,
+    "n_train": 2500,
+    "n_eval": 2461,
+    "auc_roc": 0.5374,
+    "brier_score": 0.2625,
+    "log_loss": 0.7224,
+    "cal_brier": 0.2533,
+    "yrfi_rate_eval": 0.4665
+  },
+  "train_2023-2024_eval_2025": {
+    "train_seasons": [
+      2023,
+      2024
+    ],
+    "eval_season": 2025,
+    "n_train": 4961,
+    "n_eval": 2449,
+    "auc_roc": 0.5367,
+    "brier_score": 0.2584,
+    "log_loss": 0.7129,
+    "cal_brier": 0.2503,
+    "yrfi_rate_eval": 0.5022
+  }
+}

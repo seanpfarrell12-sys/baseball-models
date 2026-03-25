@@ -311,6 +311,33 @@ def build_bullpen_features(fg_pit: pd.DataFrame) -> dict:
                 entry[feat] = float((vals * weights).sum() / weights.sum())
         bp_lookup[(team, int(season))] = entry
 
+    # ── Bullpen workload / fatigue from pitcher efficiency file ───────────────
+    # gmLI (game-entry leverage index) measures how often bullpen arms enter
+    # in high-leverage situations — a proxy for fatigue demand on key relievers.
+    eff_path = os.path.join(BASE_DIR, "data", "raw", "raw_pitcher_efficiency.csv")
+    if os.path.exists(eff_path):
+        eff = pd.read_csv(eff_path, low_memory=False)
+        if "Season" in eff.columns:
+            eff = eff.rename(columns={"Season": "season"})
+        gs_col = "GS" if "GS" in eff.columns else None
+        if gs_col:
+            rp_eff = eff[(pd.to_numeric(eff[gs_col], errors="coerce").fillna(0) < 5)].copy()
+        else:
+            rp_eff = eff.copy()
+        if "Team" in rp_eff.columns:
+            rp_eff["team_std"] = rp_eff["Team"].map(RETRO_TO_STD).fillna(rp_eff["Team"])
+        if not rp_eff.empty and "team_std" in rp_eff.columns and "season" in rp_eff.columns:
+            for (team, season), grp in rp_eff.groupby(["team_std", "season"]):
+                entry = bp_lookup.setdefault((team, int(season)), {})
+                if "gmLI" in grp.columns:
+                    gmli_vals = pd.to_numeric(grp["gmLI"], errors="coerce").dropna()
+                    if not gmli_vals.empty:
+                        entry["bp_gmLI"] = float(gmli_vals.mean())
+                if "G" in grp.columns:
+                    entry["bp_total_apps"] = float(
+                        pd.to_numeric(grp["G"], errors="coerce").sum()
+                    )
+
     return bp_lookup
 
 

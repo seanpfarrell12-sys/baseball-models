@@ -431,6 +431,60 @@ def pull_team_offense_defense(years: list) -> tuple:
     return team_bat, team_pit
 
 
+def pull_ump_scorecards(game_years: list) -> pd.DataFrame:
+    """
+    Pull umpire strike-zone accuracy data from the UmpScorecards API.
+    Returns per-game metrics keyed by game_pk: overall_accuracy, favor,
+    total_run_impact, consistency.  Saves to raw_ump_scorecards.csv.
+    """
+    out_path = os.path.join(RAW_DIR, "raw_ump_scorecards.csv")
+    if os.path.exists(out_path):
+        existing = pd.read_csv(out_path)
+        print(f"    Umpire data: loading from cache ({len(existing):,} rows)")
+        return existing
+
+    UMP_URL = "https://umpscorecards.com/api/games/"
+    all_frames = []
+    for yr in game_years:
+        print(f"  Pulling UmpScorecards for {yr}...")
+        try:
+            r = requests.get(UMP_URL, params={"year": yr}, timeout=60)
+            r.raise_for_status()
+            data = r.json()
+            # API returns {"rows": [...]} or bare list
+            rows = data.get("rows", data) if isinstance(data, dict) else data
+            if rows:
+                df = pd.DataFrame(rows)
+                df["season"] = yr
+                all_frames.append(df)
+                print(f"    {yr}: {len(df):,} games (raw pull)")
+            time.sleep(1)
+        except Exception as e:
+            print(f"    WARNING: UmpScorecards {yr} — {e}")
+
+    if not all_frames:
+        print("  WARNING: No umpire data collected")
+        return pd.DataFrame()
+
+    ump = pd.concat(all_frames, ignore_index=True)
+    # API returns all historical years regardless of year param; deduplicate
+    if "date" in ump.columns:
+        ump["_year"] = pd.to_datetime(ump["date"], errors="coerce").dt.year
+        ump = ump[ump["_year"].isin(game_years)].drop(columns=["_year"])
+    ump = ump.drop_duplicates(subset="game_pk") if "game_pk" in ump.columns else ump
+    rename = {
+        "overall_accuracy":  "ump_overall_accuracy",
+        "favor":             "ump_favor",
+        "total_run_impact":  "ump_total_run_impact",
+        "consistency":       "ump_consistency",
+    }
+    ump.rename(columns={k: v for k, v in rename.items() if k in ump.columns},
+               inplace=True)
+    ump.to_csv(out_path, index=False)
+    print(f"  ✓ Saved raw_ump_scorecards.csv ({len(ump):,} rows)")
+    return ump
+
+
 def pull_sp_stats(years: list) -> pd.DataFrame:
     """Pull individual SP stats (SIERA, xFIP, K%, GB%) for each team's rotation."""
     all_sp = []
@@ -460,26 +514,26 @@ if __name__ == "__main__":
     print("=" * 70)
 
     # ── 1. Game results (training labels) ───────────────────────────────────
-    print("\n[ 1/5 ] Pulling game totals (training labels)...")
+    print("\n[ 1/6 ] Pulling game totals (training labels)...")
     games_df = pull_game_totals(TRAIN_YEARS, ALL_TEAMS_BREF)
     games_df.to_csv(os.path.join(RAW_DIR, "raw_game_schedules.csv"), index=False)
     print(f"  ✓ Saved raw_game_schedules.csv ({len(games_df):,} rows)")
 
     # ── 2. Team offense/defense ──────────────────────────────────────────────
-    print("\n[ 2/5 ] Pulling team offense/defense stats...")
+    print("\n[ 2/6 ] Pulling team offense/defense stats...")
     team_bat_df, team_pit_df = pull_team_offense_defense(TRAIN_YEARS)
     team_bat_df.to_csv(os.path.join(RAW_DIR, "raw_team_batting.csv"), index=False)
     team_pit_df.to_csv(os.path.join(RAW_DIR, "raw_team_pitching.csv"), index=False)
     print(f"  ✓ Saved raw_team_batting.csv, raw_team_pitching.csv")
 
     # ── 3. SP stats ──────────────────────────────────────────────────────────
-    print("\n[ 3/5 ] Pulling starting pitcher stats...")
+    print("\n[ 3/6 ] Pulling starting pitcher stats...")
     sp_df = pull_sp_stats(TRAIN_YEARS)
     sp_df.to_csv(os.path.join(RAW_DIR, "raw_sp_stats.csv"), index=False)
     print(f"  ✓ Saved raw_sp_stats.csv ({len(sp_df):,} rows)")
 
     # ── 4. Historical weather (Open-Meteo archive) ───────────────────────────
-    print("\n[ 4/5 ] Pulling historical weather from Open-Meteo archive...")
+    print("\n[ 4/6 ] Pulling historical weather from Open-Meteo archive...")
     print("  (One API call per stadium per year — this takes a few minutes)")
     weather_df = pull_historical_weather(TRAIN_YEARS)
     if not weather_df.empty:
@@ -488,8 +542,12 @@ if __name__ == "__main__":
     else:
         print("  WARNING: No weather data pulled — will use city averages as fallback")
 
-    # ── 5. Static metadata (park factors, geo, CF bearings, manager hooks) ──
-    print("\n[ 5/5 ] Saving static stadium metadata...")
+    # ── 5. Umpire strike-zone accuracy (UmpScorecards API) ───────────────────
+    print("\n[ 5/6 ] Pulling umpire accuracy data from UmpScorecards...")
+    pull_ump_scorecards(TRAIN_YEARS)
+
+    # ── 6. Static metadata (park factors, geo, CF bearings, manager hooks) ──
+    print("\n[ 6/6 ] Saving static stadium metadata...")
 
     park_df = pd.DataFrame([
         {"team": k, **v} for k, v in PARK_FACTORS.items()

@@ -78,10 +78,11 @@ SP_FEATURES = [
     "home_sp_fi_bb_pct",        # first-inning walk rate
     "home_sp_fi_hr_per_9",      # first-inning HR/9
     "home_sp_fi_whiff_pct",     # first-inning swinging strike rate
+    "home_sp_fi_fstrike_pct",   # first-inning first-pitch strike rate (Statcast)
     "home_sp_stuff_plus",       # FanGraphs Stuff+ (overall pitch quality)
     "home_sp_location_plus",    # FanGraphs Location+ (command/control)
     "home_sp_swstr_pct",        # SwStr% (proxy if Stuff+ unavailable)
-    "home_sp_f_strike_pct",     # First-pitch strike rate
+    "home_sp_f_strike_pct",     # First-pitch strike rate (FanGraphs season)
     "home_sp_is_lhp",           # 1 = LHP, 0 = RHP (handedness)
     # Away SP (pitching in the bottom half of 1st; limiting home team)
     "away_sp_fi_era",
@@ -89,6 +90,7 @@ SP_FEATURES = [
     "away_sp_fi_bb_pct",
     "away_sp_fi_hr_per_9",
     "away_sp_fi_whiff_pct",
+    "away_sp_fi_fstrike_pct",   # first-inning first-pitch strike rate (Statcast)
     "away_sp_stuff_plus",
     "away_sp_location_plus",
     "away_sp_swstr_pct",
@@ -121,6 +123,10 @@ ENVIRONMENTAL_FEATURES = [
     "alt_carry_factor",         # altitude HR carry boost
     "altitude_ft",              # park altitude
     "is_dome",                  # 1 = dome/retractable (weather irrelevant)
+    # Umpire strike-zone accuracy (UmpScorecards)
+    "ump_overall_accuracy",     # % of calls correct (higher = tighter zone)
+    "ump_total_run_impact",     # run impact of missed calls (higher = more runs lost/added)
+    "ump_favor",                # run advantage one team received from missed calls
 ]
 
 INTERACTION_FEATURES = [
