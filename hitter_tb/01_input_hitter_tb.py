@@ -190,10 +190,11 @@ def pull_batting_splits(stat_years: list) -> tuple:
             "players":      "",
             "z_players":    "",
         }
-        headers = {"User-Agent": "baseball-model-research/1.0"}
+        headers = {"User-Agent": "baseball-model-research/1.0",
+                   "Content-Type": "application/json"}
         try:
-            r = requests.get(base_url, params=params, headers=headers,
-                             timeout=30)
+            r = requests.post(base_url, json=params, headers=headers,
+                              timeout=30)
             r.raise_for_status()
             data = r.json()
             rows = data.get("data", data) if isinstance(data, dict) else data
@@ -212,8 +213,13 @@ def pull_batting_splits(stat_years: list) -> tuple:
         rhp_frames.append(_fetch_split(SPLIT_CODES["vs_rhp"], "vs_rhp", yr))
         time.sleep(1.5)
 
-    df_lhp = pd.concat([f for f in lhp_frames if not f.empty], ignore_index=True)
-    df_rhp = pd.concat([f for f in rhp_frames if not f.empty], ignore_index=True)
+    lhp_valid = [f for f in lhp_frames if not f.empty]
+    rhp_valid = [f for f in rhp_frames if not f.empty]
+    if not lhp_valid or not rhp_valid:
+        print("  WARNING: FG batting splits returned no data — lineup platoon features will be null")
+        return pd.DataFrame(), pd.DataFrame()
+    df_lhp = pd.concat(lhp_valid, ignore_index=True)
+    df_rhp = pd.concat(rhp_valid, ignore_index=True)
 
     # FanGraphs batting data uses "playerid" or "IDfg"
     for df in [df_lhp, df_rhp]:

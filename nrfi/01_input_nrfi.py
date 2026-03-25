@@ -285,9 +285,10 @@ def pull_batting_splits_nrfi(stat_years: list) -> tuple:
             "players": "", "z_players": "",
         }
         try:
-            r = requests.get(base_url, params=params,
-                             headers={"User-Agent": "baseball-research/1.0"},
-                             timeout=30)
+            r = requests.post(base_url, data=params,
+                              headers={"User-Agent": "baseball-research/1.0",
+                                       "Referer": "https://www.fangraphs.com/"},
+                              timeout=30)
             r.raise_for_status()
             data = r.json()
             rows = data.get("data", data) if isinstance(data, dict) else data
@@ -306,8 +307,13 @@ def pull_batting_splits_nrfi(stat_years: list) -> tuple:
         rhp_frames.append(_fetch(SPLIT_CODES["vs_rhp"], "vs_rhp", yr))
         time.sleep(1.5)
 
-    df_lhp = pd.concat([f for f in lhp_frames if not f.empty], ignore_index=True)
-    df_rhp = pd.concat([f for f in rhp_frames if not f.empty], ignore_index=True)
+    lhp_valid = [f for f in lhp_frames if not f.empty]
+    rhp_valid = [f for f in rhp_frames if not f.empty]
+    if not lhp_valid or not rhp_valid:
+        print("  WARNING: FG batting splits returned no data — platoon features will be null")
+        return pd.DataFrame(), pd.DataFrame()
+    df_lhp = pd.concat(lhp_valid, ignore_index=True)
+    df_rhp = pd.concat(rhp_valid, ignore_index=True)
 
     for df in [df_lhp, df_rhp]:
         for col in ["playerid", "IDfg", "PlayerID"]:
@@ -378,6 +384,14 @@ def pull_historical_weather_nrfi(game_years: list) -> pd.DataFrame:
                 print(f"    WARNING: weather {team} {yr} — {e}")
 
     wx_df = pd.DataFrame(records)
+    if wx_df.empty:
+        print("  WARNING: No weather records collected — "
+              "weather features will be null (check network connectivity)")
+        empty = pd.DataFrame(columns=["team", "season", "date",
+                                      "temperature_f", "humidity_pct",
+                                      "wind_speed_mph", "wind_dir_deg"])
+        empty.to_csv(existing, index=False)
+        return empty
     # Average over the 6-8pm window per (team, date)
     wx_agg = (wx_df.groupby(["team", "season", "date"])
               [["temperature_f", "humidity_pct",

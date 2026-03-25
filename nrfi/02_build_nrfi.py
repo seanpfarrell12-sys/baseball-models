@@ -133,10 +133,14 @@ def load_fg_pitching() -> pd.DataFrame:
 
 
 def load_batting_splits() -> tuple:
-    lhp = pd.read_csv(os.path.join(RAW_DIR, "raw_batting_splits_lhp.csv"),
-                      low_memory=False)
-    rhp = pd.read_csv(os.path.join(RAW_DIR, "raw_batting_splits_rhp.csv"),
-                      low_memory=False)
+    lhp_path = os.path.join(RAW_DIR, "raw_batting_splits_lhp.csv")
+    rhp_path = os.path.join(RAW_DIR, "raw_batting_splits_rhp.csv")
+    if not os.path.exists(lhp_path) or not os.path.exists(rhp_path):
+        print("  WARNING: batting splits files not found — "
+              "top-3 platoon features will be null")
+        return pd.DataFrame(), pd.DataFrame()
+    lhp = pd.read_csv(lhp_path, low_memory=False)
+    rhp = pd.read_csv(rhp_path, low_memory=False)
     for df in [lhp, rhp]:
         for col in ["IDfg", "playerid", "PlayerID"]:
             if col in df.columns:
