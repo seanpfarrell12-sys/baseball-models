@@ -2,7 +2,7 @@
 =============================================================================
 LAUNCHD SETUP — installs two macOS background services:
   1. com.baseballmodels.scheduler  — runs models T-90 min before each game
-  2. com.baseballmodels.grader     — grades yesterday's picks at 9am daily
+  2. com.baseballmodels.grader     — grades yesterday's picks at 4am daily
 =============================================================================
 Run once:
     python3 setup_launchd.py           # install both
@@ -42,11 +42,11 @@ JOBS = [
     {
         "label":   "com.baseballmodels.grader",
         "script":  BASE_DIR / "grade_daily.py",
-        "hour":    9,
+        "hour":    4,
         "minute":  0,
         "stdout":  LOG_DIR / "grader_stdout.log",
         "stderr":  LOG_DIR / "grader_stderr.log",
-        "desc":    "Results grader (runs at 9am, grades yesterday's picks)",
+        "desc":    "Results grader (runs at 4am, grades yesterday's picks)",
     },
 ]
 
@@ -111,7 +111,7 @@ def install():
     print("  Daily schedule:")
     print("    6:00 AM — pull fresh stats + retrain all 5 models")
     print("    8:00 AM — scheduler wakes, waits until T-90 before each game window")
-    print("    9:00 AM — grade yesterday's picks → post results to Discord")
+    print("    4:00 AM — grade yesterday's picks → post results to Discord")
     print("    T-90    — models run → SMS + Discord picks sent")
     print(f"\n  Logs: {LOG_DIR}/")
 
