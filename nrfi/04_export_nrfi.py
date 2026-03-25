@@ -605,11 +605,12 @@ def run_nrfi_export(target_date: str = None, verbose: bool = True) -> pd.DataFra
         print(f"  WARNING: probable starters failed — {e}")
         starters = []
 
-    if not starters:
+    if starters is None or (isinstance(starters, pd.DataFrame) and starters.empty) or (not isinstance(starters, pd.DataFrame) and not starters):
         print("  No probable starters available — cannot score NRFI today")
         return pd.DataFrame()
 
-    print(f"  {len(starters)} probable SP matchups found")
+    n_starters = len(starters) if hasattr(starters, "__len__") else 0
+    print(f"  {n_starters} probable SP matchups found")
 
     # ── Lineups ───────────────────────────────────────────────────────────────
     print(f"\n[ Lineups ] Fetching confirmed lineups...")
@@ -633,22 +634,33 @@ def run_nrfi_export(target_date: str = None, verbose: bool = True) -> pd.DataFra
         print("  No NRFI/YRFI odds available — will export model probs only")
 
     # ── Score each game ───────────────────────────────────────────────────────
-    print(f"\n[ Score ] Scoring {len(starters)} games...")
+    n_games = len(starters) if hasattr(starters, "__len__") else 0
+    print(f"\n[ Score ] Scoring {n_games} games...")
     results = []
 
-    for matchup in starters:
+    # starters is a DataFrame; iterate rows
+    starters_iter = starters.iterrows() if isinstance(starters, pd.DataFrame) else enumerate(starters)
+    for _, matchup in starters_iter:
+        if isinstance(matchup, pd.Series):
+            matchup = matchup.to_dict()
         home_team     = matchup.get("home_team", "")
         away_team     = matchup.get("away_team", "")
-        home_sp_name  = matchup.get("home_pitcher", "")
-        away_sp_name  = matchup.get("away_pitcher", "")
-        home_sp_hand  = matchup.get("home_pitcher_hand", "R")
-        away_sp_hand  = matchup.get("away_pitcher_hand", "R")
+        home_sp_name  = matchup.get("home_sp_name", matchup.get("home_pitcher", ""))
+        away_sp_name  = matchup.get("away_sp_name", matchup.get("away_pitcher", ""))
+        home_sp_hand  = matchup.get("home_sp_hand", matchup.get("home_pitcher_hand", "R"))
+        away_sp_hand  = matchup.get("away_sp_hand", matchup.get("away_pitcher_hand", "R"))
 
         # Top-3 lineup slots (from confirmed lineups if available)
         def _top3(team_key):
-            team_lu = lineups.get(team_key, {})
-            slots   = team_lu.get("batting_order", [])
-            names   = [s.get("name", "") for s in slots[:3]]
+            team_lu = lineups.get(team_key, [])
+            # lineups values are plain lists of player name strings
+            if isinstance(team_lu, list):
+                names = list(team_lu[:3])
+            elif isinstance(team_lu, dict):
+                slots = team_lu.get("batting_order", [])
+                names = [s.get("name", "") if isinstance(s, dict) else str(s) for s in slots[:3]]
+            else:
+                names = []
             while len(names) < 3:
                 names.append("")
             return names
