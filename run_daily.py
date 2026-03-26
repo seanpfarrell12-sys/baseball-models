@@ -25,8 +25,10 @@ import pandas as pd
 from datetime import datetime, date, timedelta
 
 BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
-EXPORT_DIR = os.path.join(BASE_DIR, "exports")
 today_str  = datetime.now().strftime("%Y%m%d")
+run_str    = datetime.now().strftime("%H%M")
+EXPORT_DIR = os.path.join(BASE_DIR, "exports", today_str)
+os.makedirs(EXPORT_DIR, exist_ok=True)
 
 sys.path.insert(0, BASE_DIR)
 
@@ -76,13 +78,13 @@ def run_moneyline():
 
     edge_report = m.build_edge_report(predictions_df, odds_df)
     edge_report.to_excel(
-        os.path.join(EXPORT_DIR, f"moneyline_edges_{today_str}.xlsx"),
+        os.path.join(EXPORT_DIR, f"moneyline_edges_{today_str}_{run_str}.xlsx"),
         index=False, engine="openpyxl"
     )
     value_bets = edge_report[edge_report["is_value_bet"] == 1]
     if not value_bets.empty:
         value_bets.to_excel(
-            os.path.join(EXPORT_DIR, f"moneyline_plays_{today_str}.xlsx"),
+            os.path.join(EXPORT_DIR, f"moneyline_plays_{today_str}_{run_str}.xlsx"),
             index=False, engine="openpyxl"
         )
     print(f"  ✓ {len(edge_report)} matchups | {len(value_bets)} value bets")
@@ -105,22 +107,15 @@ def run_totals():
     if predictions_df.empty:
         return None
 
-    import pandas as pd
-    predictions_df = predictions_df.merge(
-        odds_df[["home_team", "away_team", "ou_line"]].drop_duplicates(
-            ["home_team", "away_team"]
-        ),
-        on=["home_team", "away_team"], how="left"
-    )
     edge_report = m.build_totals_edge_report(predictions_df, odds_df)
     edge_report.to_excel(
-        os.path.join(EXPORT_DIR, f"totals_edges_{today_str}.xlsx"),
+        os.path.join(EXPORT_DIR, f"totals_edges_{today_str}_{run_str}.xlsx"),
         index=False, engine="openpyxl"
     )
     value_bets = edge_report[edge_report["is_value_bet"] == 1]
     if not value_bets.empty:
         value_bets.to_excel(
-            os.path.join(EXPORT_DIR, f"totals_plays_{today_str}.xlsx"),
+            os.path.join(EXPORT_DIR, f"totals_plays_{today_str}_{run_str}.xlsx"),
             index=False, engine="openpyxl"
         )
     print(f"  ✓ {len(edge_report)} O/U bets | {len(value_bets)} value bets")
@@ -151,13 +146,13 @@ def run_hitter_tb():
     print(m.generate_daily_summary(edge_report))
 
     edge_report.to_excel(
-        os.path.join(EXPORT_DIR, f"hitter_tb_edges_{today_str}.xlsx"),
+        os.path.join(EXPORT_DIR, f"hitter_tb_edges_{today_str}_{run_str}.xlsx"),
         index=False, engine="openpyxl"
     )
     value_bets = edge_report[edge_report["is_value_bet"] == 1]
     if not value_bets.empty:
         value_bets.to_excel(
-            os.path.join(EXPORT_DIR, f"hitter_tb_plays_{today_str}.xlsx"),
+            os.path.join(EXPORT_DIR, f"hitter_tb_plays_{today_str}_{run_str}.xlsx"),
             index=False, engine="openpyxl"
         )
     print(f"  ✓ {len(edge_report)} props | {len(value_bets)} value bets")
@@ -188,13 +183,13 @@ def run_pitcher_outs():
     print(m.generate_daily_summary(edge_report))
 
     edge_report.to_excel(
-        os.path.join(EXPORT_DIR, f"pitcher_outs_edges_{today_str}.xlsx"),
+        os.path.join(EXPORT_DIR, f"pitcher_outs_edges_{today_str}_{run_str}.xlsx"),
         index=False, engine="openpyxl"
     )
     value_bets = edge_report[edge_report["is_value_bet"] == 1]
     if not value_bets.empty:
         value_bets.to_excel(
-            os.path.join(EXPORT_DIR, f"pitcher_outs_plays_{today_str}.xlsx"),
+            os.path.join(EXPORT_DIR, f"pitcher_outs_plays_{today_str}_{run_str}.xlsx"),
             index=False, engine="openpyxl"
         )
     print(f"  ✓ {len(edge_report)} props | {len(value_bets)} value bets")
@@ -260,7 +255,7 @@ if __name__ == "__main__":
 
     # ── Combined Excel workbook ────────────────────────────────────────────
     import pandas as pd
-    combined_path = os.path.join(EXPORT_DIR, f"daily_report_{today_str}.xlsx")
+    combined_path = os.path.join(EXPORT_DIR, f"daily_report_{today_str}_{run_str}.xlsx")
     TAB_NAMES = {
         "Moneyline":    "Moneyline",
         "Totals O/U":   "Totals",
@@ -316,3 +311,24 @@ if __name__ == "__main__":
     print(f"{'=' * 70}\n")
 
     print_performance_summary(n_days=30)
+
+    # ── Push exports and picks to GitHub for monitoring agents ────────────────
+    import subprocess
+    try:
+        subprocess.run(
+            ["git", "add", f"exports/{today_str}/", "tracking/picks.xlsx"],
+            cwd=BASE_DIR, check=True, capture_output=True
+        )
+        result = subprocess.run(
+            ["git", "commit", "-m", f"Daily picks: {today_str}"],
+            cwd=BASE_DIR, capture_output=True
+        )
+        if result.returncode == 0:
+            subprocess.run(["git", "push"], cwd=BASE_DIR, check=True, capture_output=True)
+            print("  ✓ Results pushed to GitHub.")
+        elif b"nothing to commit" in result.stdout + result.stderr:
+            print("  (git) Nothing new to commit.")
+        else:
+            result.check_returncode()
+    except Exception as e:
+        print(f"  WARNING: git push failed — {e}")

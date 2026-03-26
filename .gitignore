@@ -6,11 +6,15 @@ utils/.an_credentials.json
 utils/.notifier_credentials.json
 tracking/changelog.json
 
-# Tracking data — personal performance log
-tracking/
+# Tracking data — keep picks.xlsx for monitoring agents, ignore the rest
+tracking/*
+!tracking/picks.xlsx
 
-# Exported reports
-exports/
+# Exported reports — keep .xlsx files inside dated subfolders, ignore everything else
+exports/*
+!exports/*/
+exports/*/*
+!exports/*/*.xlsx
 
 # Logs
 logs/

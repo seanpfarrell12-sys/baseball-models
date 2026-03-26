@@ -39,3 +39,26 @@ else:
                       ["No picks from yesterday to grade, or results not yet final."])
 
 print(f"\n{'=' * 60}\n")
+
+# ── Push graded results to GitHub for monitoring agents ───────────────────
+import subprocess
+from pathlib import Path as _Path
+_BASE_DIR = str(_Path(__file__).parent)
+try:
+    subprocess.run(
+        ["git", "add", "tracking/picks.xlsx"],
+        cwd=_BASE_DIR, check=True, capture_output=True
+    )
+    result = subprocess.run(
+        ["git", "commit", "-m", f"Graded results: {yesterday_str}"],
+        cwd=_BASE_DIR, capture_output=True
+    )
+    if result.returncode == 0:
+        subprocess.run(["git", "push"], cwd=_BASE_DIR, check=True, capture_output=True)
+        print("  ✓ Graded results pushed to GitHub.")
+    elif b"nothing to commit" in result.stdout + result.stderr:
+        print("  (git) Nothing new to commit.")
+    else:
+        result.check_returncode()
+except Exception as e:
+    print(f"  WARNING: git push failed — {e}")

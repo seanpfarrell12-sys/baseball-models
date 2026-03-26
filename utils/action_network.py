@@ -410,11 +410,11 @@ def _parse_game_odds(game: dict) -> dict:
     # Consensus = median across books, with outlier filtering for totals.
     # A single book posting a stale/alt-market line (e.g. FanDuel at 8.5 when
     # everyone else has 7.0) would otherwise skew a small-n median.
-    # We drop any total more than 1.5 runs from the median before finalising.
+    # We drop any total more than 0.5 runs from the median before finalising.
     def med(lst, default=None):
         return float(np.median(lst)) if lst else default
 
-    def med_filtered(lst, threshold=1.5, default=None):
+    def med_filtered(lst, threshold=0.5, default=None):
         if not lst:
             return default
         m = float(np.median(lst))
@@ -558,6 +558,8 @@ def _parse_props_v2(entries: list, players_map: dict, prop_type: str) -> pd.Data
             if not isinstance(book_lines, list):
                 continue
             for line in book_lines:
+                if line.get("is_live"):          # skip live (in-game) lines
+                    continue
                 value = line.get("value")
                 side  = str(line.get("side", "")).lower()
                 odds  = line.get("odds")

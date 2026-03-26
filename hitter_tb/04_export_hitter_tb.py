@@ -58,7 +58,7 @@ ODDS_API_URL_PROPS = "https://api.the-odds-api.com/v4/sports/baseball_mlb/events
 # For player props, use smaller Kelly fraction (lower liquidity)
 KELLY_FRACTION_PROPS = 0.15  # 15% Kelly for player props
 MAX_BET_FRACTION     = 0.03  # Max 3% of bankroll per player prop (lower than game lines)
-MIN_EDGE             = 0.04  # 4% minimum edge (higher bar for props — more variance)
+MIN_EDGE             = 0.07  # 7% minimum edge (higher bar for props — more variance)
 
 
 # =============================================================================

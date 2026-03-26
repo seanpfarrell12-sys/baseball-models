@@ -63,7 +63,7 @@ ODDS_API_URL_TOT = "https://api.the-odds-api.com/v4/sports/baseball_mlb/odds/"
 
 KELLY_FRACTION   = 0.25
 MAX_BET_FRACTION = 0.05
-MIN_EDGE         = 0.03
+MIN_EDGE         = 0.06
 
 
 # =============================================================================
@@ -452,8 +452,17 @@ def build_totals_edge_report(predictions_df: pd.DataFrame,
     rows = []
 
     for _, row in df.iterrows():
-        lambda_hat  = row.get("lambda_hat", 8.5)
-        ou_line     = row.get("ou_line", 8.5)
+        lambda_hat  = row.get("lambda_hat")
+        ou_line     = row.get("ou_line")
+
+        if pd.isna(ou_line) or pd.isna(lambda_hat):
+            home = row.get("home_team", "?")
+            away = row.get("away_team", "?")
+            print(f"  SKIP: No totals odds found for {away} @ {home} — skipping game.")
+            continue
+
+        lambda_hat = float(lambda_hat)
+        ou_line    = float(ou_line)
 
         # Compute p_over/p_under from lambda_hat + Poisson distribution
         # This handles both the old predictions CSV path and the new live scoring path

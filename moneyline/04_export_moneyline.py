@@ -83,7 +83,7 @@ KELLY_FRACTION = 0.25
 MAX_BET_FRACTION = 0.05   # Never bet more than 5% of bankroll
 
 # Minimum edge (in probability units) to consider a bet
-MIN_EDGE = 0.03           # 3% edge minimum — filters out noise
+MIN_EDGE = 0.06           # 6% edge minimum — filters out noise
 
 # Minimum numeric edge score to include in "strong plays" report
 MIN_EDGE_SCORE = 5.0

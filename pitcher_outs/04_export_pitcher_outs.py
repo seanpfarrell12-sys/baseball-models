@@ -62,7 +62,7 @@ EXPORT_DIR = os.path.join(BASE_DIR, "exports")
 ODDS_API_KEY         = "fbc985ad430c95d6435cb75210f7b989"
 KELLY_FRACTION_PROPS = 0.15   # 15% Kelly for player props
 MAX_BET_FRACTION     = 0.04   # Max 4% per pitcher prop
-MIN_EDGE             = 0.04   # 4% min edge threshold
+MIN_EDGE             = 0.07   # 7% min edge threshold
 
 # Standard prop lines (outs recorded)
 STANDARD_OUTS_LINES = [14.5, 15.5, 16.5, 17.5, 18.5]
@@ -319,23 +319,6 @@ def build_pitcher_edge_report(predictions_df: pd.DataFrame,
     report_df = pd.DataFrame(rows)
     if not report_df.empty:
         report_df = report_df.sort_values("edge_score", ascending=False).reset_index(drop=True)
-        # Keep only the single best-scoring value bet per game (max 1 pick per matchup).
-        # Both starters showing an edge usually signals model bias, not two genuine
-        # market inefficiencies — take only the stronger signal.
-        game_key = report_df.apply(
-            lambda r: "_".join(sorted([str(r.get("team", "")), str(r.get("opp_team", ""))])),
-            axis=1,
-        )
-        report_df["_game_key"] = game_key
-        best_idx = (
-            report_df[report_df["is_value_bet"] == 1]
-            .groupby("_game_key")["edge_score"]
-            .idxmax()
-        )
-        report_df["is_value_bet"] = 0
-        if not best_idx.empty:
-            report_df.loc[best_idx.values, "is_value_bet"] = 1
-        report_df = report_df.drop(columns=["_game_key"])
     return report_df
 
 

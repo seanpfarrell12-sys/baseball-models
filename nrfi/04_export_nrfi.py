@@ -76,7 +76,7 @@ os.makedirs(EXPORT_DIR, exist_ok=True)
 ODDS_API_KEY      = "fbc985ad430c95d6435cb75210f7b989"
 KELLY_FRACTION    = 0.25    # fractional Kelly for game-level markets
 MAX_BET_FRACTION  = 0.04    # cap per game at 4% of bankroll
-MIN_EDGE          = 0.03    # minimum edge to flag as a pick (3%)
+MIN_EDGE          = 0.06    # minimum edge to flag as a pick (6%)
 CURRENT_SEASON    = 2026
 
 # Open-Meteo forecast URL
@@ -871,7 +871,11 @@ def run_nrfi_export(target_date: str = None, verbose: bool = True) -> pd.DataFra
     col_order = [c for c in col_order if c in df.columns]
     df = df[col_order + [c for c in df.columns if c not in col_order]]
 
-    out_path = os.path.join(EXPORT_DIR, f"nrfi_edges_{today_str}.csv")
+    run_str    = datetime.now().strftime("%H%M")
+    date_str   = datetime.strptime(today_str, "%Y-%m-%d").strftime("%Y%m%d")
+    export_dir = os.path.join(BASE_DIR, "exports", date_str)
+    os.makedirs(export_dir, exist_ok=True)
+    out_path = os.path.join(export_dir, f"nrfi_edges_{date_str}_{run_str}.csv")
     df.to_csv(out_path, index=False)
     print(f"\n  ✓ Exported {len(df)} games → {out_path}")
 
