@@ -275,12 +275,17 @@ def get_team_avg_sp_stats(team_abbr: str, pitching_df: pd.DataFrame) -> dict:
 
 def get_probable_starters(game_date: str = None) -> pd.DataFrame:
     """
-    Fetch today's probable starting pitchers from MLB Stats API.
+    Fetch today's starting pitchers from MLB Stats API.
+
+    Prefers the confirmed starter from the submitted lineup card (available
+    ~60–90 min before first pitch). Falls back to probablePitcher for games
+    whose lineup card hasn't been submitted yet.
 
     Returns
     -------
     pd.DataFrame with columns:
       home_team, away_team, home_sp_name, away_sp_name,
+      home_sp_confirmed, away_sp_confirmed,  (True = from lineup card)
       game_time, game_pk, game_type
     """
     if game_date is None:
@@ -290,7 +295,7 @@ def get_probable_starters(game_date: str = None) -> pd.DataFrame:
         response = requests.get(
             MLB_SCHEDULE_URL,
             params={"sportId": 1, "date": game_date,
-                    "hydrate": "probablePitcher,team"},
+                    "hydrate": "probablePitcher,team,lineups"},
             timeout=10,
         )
         response.raise_for_status()
@@ -318,23 +323,46 @@ def get_probable_starters(game_date: str = None) -> pd.DataFrame:
             if home_abbr not in MLB_TEAMS or away_abbr not in MLB_TEAMS:
                 continue
 
-            home_sp = home_info.get("probablePitcher", {}).get("fullName", "")
-            away_sp = away_info.get("probablePitcher", {}).get("fullName", "")
+            # ── Confirmed starter from lineup card (preferred) ─────────────
+            game_lineups = game.get("lineups", {})
+            home_confirmed_sp = next(
+                (p["fullName"] for p in game_lineups.get("homePlayers", [])
+                 if p.get("primaryPosition", {}).get("type") == "Pitcher"),
+                None,
+            )
+            away_confirmed_sp = next(
+                (p["fullName"] for p in game_lineups.get("awayPlayers", [])
+                 if p.get("primaryPosition", {}).get("type") == "Pitcher"),
+                None,
+            )
+
+            # ── Probable pitcher fallback ──────────────────────────────────
+            home_probable_sp = home_info.get("probablePitcher", {}).get("fullName", "")
+            away_probable_sp = away_info.get("probablePitcher", {}).get("fullName", "")
+
+            home_sp        = home_confirmed_sp or home_probable_sp
+            away_sp        = away_confirmed_sp or away_probable_sp
+            home_confirmed = home_confirmed_sp is not None
+            away_confirmed = away_confirmed_sp is not None
 
             records.append({
-                "game_pk":      game.get("gamePk", ""),
-                "game_time":    game.get("gameDate", ""),
-                "game_type":    game.get("gameType", ""),   # R=regular, S=spring
-                "home_team":    home_abbr,
-                "away_team":    away_abbr,
-                "home_sp_name": home_sp,
-                "away_sp_name": away_sp,
+                "game_pk":           game.get("gamePk", ""),
+                "game_time":         game.get("gameDate", ""),
+                "game_type":         game.get("gameType", ""),
+                "home_team":         home_abbr,
+                "away_team":         away_abbr,
+                "home_sp_name":      home_sp,
+                "away_sp_name":      away_sp,
+                "home_sp_confirmed": home_confirmed,
+                "away_sp_confirmed": away_confirmed,
             })
 
     df = pd.DataFrame(records)
     if not df.empty:
-        n_with_sp = (df["home_sp_name"] != "").sum()
-        print(f"  ✓ {len(df)} games found, {n_with_sp} with probable starters announced.")
+        n_confirmed = (df["home_sp_confirmed"] | df["away_sp_confirmed"]).sum()
+        n_probable  = (~df["home_sp_confirmed"] | ~df["away_sp_confirmed"]).sum()
+        print(f"  ✓ {len(df)} games | {n_confirmed} with confirmed SP "
+              f"| {n_probable} using probable SP fallback.")
     return df
 
 
