@@ -97,15 +97,23 @@ def _parse_outs(ip_str) -> int:
         return 0
 
 
+def _normalize_pick_date(x) -> str:
+    """Normalize any pick_date value to YYYYMMDD string."""
+    if pd.isna(x):
+        return ""
+    if isinstance(x, pd.Timestamp):
+        return x.strftime("%Y%m%d")
+    s = str(x).strip()
+    if "-" in s:                        # "2026-03-25" or "2026-03-25 00:00:00"
+        return s[:10].replace("-", "")
+    return s.split(".")[0][:8]          # "20260325" or "20260325.0"
+
+
 def _load_picks() -> pd.DataFrame:
     if PICKS_FILE.exists():
         df = pd.read_excel(PICKS_FILE, engine="openpyxl")
-        # Normalize pick_date — Excel may read it back as a datetime object.
-        # Always store and compare as YYYYMMDD string.
         if "pick_date" in df.columns:
-            df["pick_date"] = pd.to_datetime(df["pick_date"], errors="coerce") \
-                                .dt.strftime("%Y%m%d") \
-                                .fillna(df["pick_date"].astype(str))
+            df["pick_date"] = df["pick_date"].apply(_normalize_pick_date)
         return df
     return pd.DataFrame(columns=PICKS_COLS)
 
