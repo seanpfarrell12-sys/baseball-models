@@ -208,14 +208,25 @@ def _get_note_for_date(pick_date: str) -> str:
 
 def save_picks(pick_date: str, results: dict):
     """
-    Extract value bets from each model's edge report and append to picks.csv.
-    Existing rows for pick_date are replaced (safe to re-run).
+    Extract value bets from each model's edge report and append to picks.xlsx.
+    Safe to re-run: duplicate picks are detected and blocked at every level.
+
+    Deduplication layers
+    --------------------
+    1. Within the new batch — drop identical picks generated in the same run.
+    2. Against existing file — any pick already logged for this date+model+game
+       is skipped; graded picks (WIN/LOSS/PUSH) are never overwritten.
+
+    Dedup key: pick_date · model · game · subject · bet_type · line
 
     Parameters
     ----------
     pick_date : str   — 'YYYYMMDD'
     results   : dict  — {model_name: edge_report_df | None}
     """
+    # Columns that uniquely identify a pick (odds/edge may shift between runs)
+    DEDUP_COLS = ["pick_date", "model", "game", "subject", "bet_type", "line"]
+
     MODEL_EXTRACTORS = {
         "Moneyline":    _extract_moneyline,
         "Totals O/U":   _extract_totals,
@@ -248,16 +259,32 @@ def save_picks(pick_date: str, results: dict):
 
     new_df = pd.DataFrame(new_rows)[PICKS_COLS]
 
-    existing = _load_picks()
-    combined = pd.concat([existing, new_df], ignore_index=True)
+    # Layer 1 — deduplicate within the new batch itself
+    n_generated = len(new_df)
+    new_df = new_df.drop_duplicates(subset=DEDUP_COLS, keep="first")
+    intra_dupes = n_generated - len(new_df)
+    if intra_dupes:
+        print(f"  (tracker) WARNING: {intra_dupes} duplicate pick(s) found within "
+              f"this run's output and removed.")
 
-    # Deduplicate: keep the first occurrence of each unique pick so earlier
-    # runs are preserved; only truly new picks from later runs are appended.
-    dedup_cols = ["pick_date", "model", "game", "subject", "bet_type", "line"]
-    combined = combined.drop_duplicates(subset=dedup_cols, keep="first")
+    existing = _load_picks()
+
+    # Layer 2 — skip new picks already present in the file.
+    # Concatenate existing first so keep="first" always retains the older row:
+    #   - PENDING picks already logged are preserved (not duplicated).
+    #   - Graded picks (WIN/LOSS/PUSH) are never overwritten by a new PENDING row.
+    combined  = pd.concat([existing, new_df], ignore_index=True)
+    n_before  = len(combined)
+    combined  = combined.drop_duplicates(subset=DEDUP_COLS, keep="first")
+    n_blocked = n_before - len(combined)
+    n_new     = len(combined) - len(existing)
+
+    if n_blocked:
+        print(f"  (tracker) Blocked {n_blocked} duplicate pick(s) — already in file.")
 
     _save_picks_df(combined)
-    print(f"  (tracker) Saved {len(new_rows)} value bets for {pick_date}")
+    print(f"  (tracker) {n_new} new pick(s) saved for {pick_date} "
+          f"({n_generated} generated, {n_blocked} duplicate(s) blocked).")
 
 
 def _extract_moneyline(r) -> dict:

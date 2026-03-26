@@ -33,11 +33,11 @@ JOBS = [
     {
         "label":   "com.baseballmodels.scheduler",
         "script":  BASE_DIR / "schedule_daily.py",
-        "hour":    8,
+        "hour":    5,
         "minute":  0,
         "stdout":  LOG_DIR / "scheduler_stdout.log",
         "stderr":  LOG_DIR / "scheduler_stderr.log",
-        "desc":    "Model scheduler (wakes at 8am, runs models T-90 min before each game)",
+        "desc":    "Model scheduler (wakes at 5am, runs models T-90 min before each game)",
     },
     {
         "label":   "com.baseballmodels.grader",
@@ -110,7 +110,7 @@ def install():
     print()
     print("  Daily schedule:")
     print("    6:00 AM — pull fresh stats + retrain all 5 models")
-    print("    8:00 AM — scheduler wakes, waits until T-90 before each game window")
+    print("    5:00 AM — scheduler wakes, waits until T-90 before each game window")
     print("    4:00 AM — grade yesterday's picks → post results to Discord")
     print("    T-90    — models run → SMS + Discord picks sent")
     print(f"\n  Logs: {LOG_DIR}/")

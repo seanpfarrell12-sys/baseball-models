@@ -22,7 +22,7 @@ import argparse
 import importlib.util
 import traceback
 import pandas as pd
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 
 BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
 today_str  = datetime.now().strftime("%Y%m%d")
@@ -35,7 +35,25 @@ sys.path.insert(0, BASE_DIR)
 parser = argparse.ArgumentParser(add_help=False)
 parser.add_argument("--note", type=str, default=None,
                     help="Log a model change note for today's picks")
+parser.add_argument("--window-games", type=str, default=None,
+                    help="Comma-separated UTC ISO timestamps for games in this window "
+                         "(passed by schedule_daily.py; limits models to this window only)")
 args, _ = parser.parse_known_args()
+
+# Parse window game times from --window-games arg (set by the scheduler)
+WINDOW_GAME_TIMES: list = []
+if args.window_games:
+    try:
+        for ts in args.window_games.split(","):
+            ts = ts.strip()
+            if ts:
+                WINDOW_GAME_TIMES.append(
+                    datetime.fromisoformat(ts).astimezone(timezone.utc)
+                )
+    except Exception as _e:
+        print(f"  WARNING: could not parse --window-games: {_e}")
+
+WINDOW_GAP = timedelta(minutes=30)   # ±30 min tolerance when filtering odds
 
 
 def load_export_module(subdir: str, filename: str):
@@ -54,6 +72,51 @@ def section(title: str):
     print("\n" + "=" * 70)
     print(f"  {title}")
     print("=" * 70)
+
+
+def _filter_to_window(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    If WINDOW_GAME_TIMES is set, filter df to rows whose game time falls
+    within ±30 min of any window game time.  Returns df unchanged if no
+    window is configured or no time column is found.
+    """
+    if not WINDOW_GAME_TIMES or df is None or df.empty:
+        return df
+
+    time_col = next(
+        (c for c in ("game_time", "start_time", "commence_time", "gameDate")
+         if c in df.columns),
+        None,
+    )
+    if time_col is None:
+        return df
+
+    def _in_window(t_val) -> bool:
+        try:
+            t = pd.Timestamp(t_val)
+            if t.tzinfo is None:
+                t = t.tz_localize("UTC")
+            else:
+                t = t.tz_convert("UTC")
+            return any(
+                abs((t - wt).total_seconds()) <= WINDOW_GAP.total_seconds()
+                for wt in WINDOW_GAME_TIMES
+            )
+        except Exception:
+            return True  # keep row if time can't be parsed
+
+    mask     = df[time_col].apply(_in_window)
+    filtered = df[mask]
+    # Safety net: if filter removed everything, fall back to full set
+    return filtered if not filtered.empty else df
+
+
+def _get_window_label() -> str:
+    """Return a human-readable label for the current window (e.g. '1:05 PM ET')."""
+    if not WINDOW_GAME_TIMES:
+        return ""
+    local = WINDOW_GAME_TIMES[0].astimezone()
+    return local.strftime("%-I:%M %p %Z")
 
 
 # =============================================================================
@@ -183,6 +246,7 @@ def run_moneyline():
     if odds_df.empty:
         print("  No games found — skipping moneyline.")
         return None
+    odds_df = _filter_to_window(odds_df)
 
     predictions_df = m.score_live_games(odds_df)
     if predictions_df.empty:
@@ -214,6 +278,7 @@ def run_totals():
     if odds_df.empty:
         print("  No games found — skipping totals.")
         return None
+    odds_df = _filter_to_window(odds_df)
 
     predictions_df = m.score_live_games_totals(odds_df)
     if predictions_df.empty:
@@ -253,6 +318,7 @@ def run_hitter_tb():
             print("  No prop odds available — skipping hitter TB edge calculation.")
             print("  (Check AN token or manually supply hitter_tb_odds_today.csv)")
             return None
+    odds_df = _filter_to_window(odds_df)
 
     edge_report = m.build_tb_edge_report(predictions_df, odds_df)
     print(m.generate_daily_summary(edge_report))
@@ -290,6 +356,7 @@ def run_pitcher_outs():
             print("  No prop odds available — skipping pitcher outs edge calculation.")
             print("  (Check AN token or manually supply pitcher_outs_odds_today.csv)")
             return None
+    odds_df = _filter_to_window(odds_df)
 
     edge_report = m.build_pitcher_edge_report(predictions_df, odds_df)
     print(m.generate_daily_summary(edge_report))
@@ -323,10 +390,43 @@ def run_nrfi():
 # =============================================================================
 # MAIN
 # =============================================================================
+def _collect_window_game_names(results: dict) -> list:
+    """
+    Extract game matchup strings (e.g. 'BOS @ NYY') from model results.
+    Tries moneyline first (cleanest game-level data), then totals.
+    Falls back to formatting the raw window game times if no results available.
+    """
+    for model_name in ("Moneyline", "Totals O/U"):
+        report = results.get(model_name)
+        if report is not None and not report.empty:
+            if "away_team" in report.columns and "home_team" in report.columns:
+                seen = set()
+                games = []
+                for _, row in report.iterrows():
+                    key = (str(row.get("away_team", "")), str(row.get("home_team", "")))
+                    if key not in seen and key[0] and key[1]:
+                        seen.add(key)
+                        games.append(f"{key[0]} @ {key[1]}")
+                if games:
+                    return games
+
+    # Fallback: use the raw window timestamps
+    if WINDOW_GAME_TIMES:
+        return [t.astimezone().strftime("%-I:%M %p %Z") for t in WINDOW_GAME_TIMES]
+
+    return []
+
+
 if __name__ == "__main__":
     start = datetime.now()
+    window_label = _get_window_label()
+    header = f"  DAILY MODEL RUN — {start.strftime('%A, %B %d, %Y')}"
+    if window_label:
+        header += f"  |  Window: {window_label}"
     print(f"\n{'=' * 70}")
-    print(f"  DAILY MODEL RUN — {start.strftime('%A, %B %d, %Y')}")
+    print(header)
+    if WINDOW_GAME_TIMES:
+        print(f"  Scoped to {len(WINDOW_GAME_TIMES)} game(s) in window starting {window_label}")
     print(f"{'=' * 70}")
 
     from utils.tracker import save_picks, print_performance_summary, log_model_change
@@ -373,12 +473,16 @@ if __name__ == "__main__":
     # ── Save today's picks for future grading ─────────────────────────────
     save_picks(today_str, results)
 
+    # ── Collect window game names for Discord messages ─────────────────────
+    window_game_names = _collect_window_game_names(results)
+
     # ── Send Discord picks ─────────────────────────────────────────────────
     from utils.notifier import send_daily_picks
     from utils.probable_starters import get_todays_game_status
     scored_games, pending_games = get_todays_game_status()
     try:
-        send_daily_picks(results, today_str, scored_games, pending_games)
+        send_daily_picks(results, today_str, scored_games, pending_games,
+                         window_games=window_game_names)
     except Exception as e:
         print(f"  WARNING: notification failed — {e}")
 
@@ -409,6 +513,11 @@ if __name__ == "__main__":
         mins, secs = divmod(elapsed_for_notif, 60)
         elapsed_str = f"{mins}m {secs}s" if mins else f"{secs}s"
         status_lines = []
+        if window_game_names:
+            status_lines.append("**Games in this run:**")
+            for g in window_game_names:
+                status_lines.append(f"  · {g}")
+            status_lines.append("")
         for name, report in results.items():
             if report is None:
                 status_lines.append(f"⊘ {name}: skipped / no data")
@@ -417,7 +526,10 @@ if __name__ == "__main__":
                     if "is_value_bet" in report.columns else "?"
                 status_lines.append(f"✓ {name}: {n} value bet(s)")
         status_lines.append(f"\n⏱ {elapsed_str}")
-        notify_run_status("✅ T-90 Models Complete", status_lines)
+        title = "✅ T-90 Models Complete"
+        if window_label:
+            title += f" — {window_label} window"
+        notify_run_status(title, status_lines)
     except Exception as e:
         print(f"  WARNING: run-status notification failed — {e}")
 

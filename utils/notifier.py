@@ -246,12 +246,20 @@ def _pick_rows(report, model_name: str, cfg: dict) -> list:
 # DISCORD FORMAT
 # =============================================================================
 
-def _format_discord(results: dict, pick_date: str) -> tuple:
+def _format_discord(results: dict, pick_date: str, window_games: list = None) -> tuple:
     """Return (title, fields, footer) for a Discord embed."""
     date_fmt = datetime.strptime(pick_date, "%Y%m%d").strftime("%A, %B %-d")
     title    = f"⚾ Daily Picks — {date_fmt}"
     fields   = []
     total    = 0
+
+    # Games-in-window field shown at the top of the embed
+    if window_games:
+        fields.append({
+            "name":   "🎯 Games in this run",
+            "value":  "\n".join(f"`{g}`" for g in window_games),
+            "inline": False,
+        })
 
     for model_name, cfg in MODEL_CONFIGS.items():
         picks = _pick_rows(results.get(model_name), model_name, cfg)
@@ -274,8 +282,8 @@ def _format_discord(results: dict, pick_date: str) -> tuple:
             "inline": False,
         })
 
-    if not fields:
-        fields = [{"name": "No value bets today", "value": "Models found no edges.", "inline": False}]
+    if not [f for f in fields if f["name"] != "🎯 Games in this run"]:
+        fields.append({"name": "No value bets today", "value": "Models found no edges.", "inline": False})
 
     footer = f"{total} value bet(s) — flat $100 stake tracking"
     return title, fields, footer
@@ -386,12 +394,13 @@ def send_graded_results(grade_date: str):
 
 
 def send_daily_picks(results: dict, pick_date: str,
-                     scored_games: list = None, pending_games: list = None):
+                     scored_games: list = None, pending_games: list = None,
+                     window_games: list = None):
     """Send today's value bets via Discord."""
     creds = _load_creds()
 
     if creds.get("discord_webhook"):
-        title, fields, footer = _format_discord(results, pick_date)
+        title, fields, footer = _format_discord(results, pick_date, window_games)
         _send_discord_embed(title, fields, footer)
         print("  (notifier) Discord message sent.")
     else:

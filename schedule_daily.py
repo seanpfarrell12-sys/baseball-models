@@ -3,7 +3,7 @@
 DAILY SCHEDULER — registers one-shot launchd jobs to run run_daily.py
                   90 minutes before each MLB game window
 =============================================================================
-Launched at 8am every day by launchd (installed via setup_launchd.py).
+Launched at 5am every day by launchd (installed via setup_launchd.py).
 
 Flow:
   1. Clean up any stale run plists from previous days
@@ -63,20 +63,24 @@ def group_into_windows(game_times: list) -> list:
     """
     Cluster game times into windows — if two games start within WINDOW_GAP
     of each other they share a single pre-game run.
-    Returns a list of the earliest time in each window.
+    Returns a list of (window_start, [game_times_in_window]) tuples.
     """
     if not game_times:
         return []
 
-    windows      = []
-    window_start = game_times[0]
+    windows         = []
+    window_start    = game_times[0]
+    window_games    = [game_times[0]]
 
     for t in game_times[1:]:
         if t - window_start > WINDOW_GAP:
-            windows.append(window_start)
+            windows.append((window_start, window_games))
             window_start = t
+            window_games = [t]
+        else:
+            window_games.append(t)
 
-    windows.append(window_start)
+    windows.append((window_start, window_games))
     return windows
 
 
@@ -101,13 +105,22 @@ def cleanup_stale_run_plists():
             log(f"Cleaned up stale plist: {plist.name}")
 
 
-def schedule_via_launchd(window_time: datetime, index: int, total: int):
+def schedule_via_launchd(window_time: datetime, index: int, total: int,
+                         window_game_times: list = None):
     """Write and load a one-shot launchd plist to run run_daily.py at T-90."""
     run_at       = window_time - LEAD_TIME
     run_at_local = run_at.astimezone()
     label        = f"{RUN_LABEL_PREFIX}{run_at_local.strftime('%Y%m%d%H%M')}"
     plist_path   = AGENTS_DIR / f"{label}.plist"
     stamp        = run_at_local.strftime("%Y%m%d_%H%M")
+
+    # Build --window-games arg: comma-separated UTC ISO timestamps
+    window_games_arg = ""
+    if window_game_times:
+        times_str = ",".join(t.strftime("%Y-%m-%dT%H:%M:%S+00:00") for t in window_game_times)
+        window_games_arg = f"""
+        <string>--window-games</string>
+        <string>{times_str}</string>"""
 
     plist = f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
@@ -120,7 +133,7 @@ def schedule_via_launchd(window_time: datetime, index: int, total: int):
     <key>ProgramArguments</key>
     <array>
         <string>{sys.executable}</string>
-        <string>{BASE_DIR / "run_daily.py"}</string>
+        <string>{BASE_DIR / "run_daily.py"}</string>{window_games_arg}
     </array>
 
     <key>StartCalendarInterval</key>
@@ -152,17 +165,21 @@ def schedule_via_launchd(window_time: datetime, index: int, total: int):
     if result.returncode != 0:
         log(f"  ERROR registering window {index}: {result.stderr.strip()}")
     else:
+        n_games = len(window_game_times) if window_game_times else "?"
         log(f"  Window {index}/{total} registered → run_daily.py at "
             f"{run_at_local.strftime('%-I:%M %p %Z')} "
-            f"(first pitch {window_time.astimezone().strftime('%-I:%M %p %Z')})")
+            f"(first pitch {window_time.astimezone().strftime('%-I:%M %p %Z')}, "
+            f"{n_games} game(s))")
 
 
-def run_models():
+def run_models(window_game_times: list = None):
+    """Run run_daily.py immediately, optionally scoped to a specific game window."""
     log("Launching run_daily.py immediately (T-90 already passed)...")
-    result = subprocess.run(
-        [sys.executable, str(BASE_DIR / "run_daily.py")],
-        capture_output=False,
-    )
+    cmd = [sys.executable, str(BASE_DIR / "run_daily.py")]
+    if window_game_times:
+        times_str = ",".join(t.strftime("%Y-%m-%dT%H:%M:%S+00:00") for t in window_game_times)
+        cmd += ["--window-games", times_str]
+    result = subprocess.run(cmd, capture_output=False)
     if result.returncode != 0:
         log(f"run_daily.py exited with code {result.returncode}")
     else:
@@ -193,43 +210,38 @@ def main():
         log("No MLB games today — exiting.")
         return
 
-    windows = group_into_windows(game_times)
-    log(f"Found {len(game_times)} game(s) across {len(windows)} time window(s).")
+    window_groups = group_into_windows(game_times)
+    total_windows = len(window_groups)
+    log(f"Found {len(game_times)} game(s) across {total_windows} time window(s).")
 
     try:
         from utils.notifier import notify_run_status
-        run_times = [
-            (w - LEAD_TIME).astimezone().strftime("%-I:%M %p %Z")
-            for w in windows
-        ]
-        first_pitch_times = [
-            w.astimezone().strftime("%-I:%M %p %Z")
-            for w in windows
-        ]
-        lines = [f"{len(game_times)} game(s) · {len(windows)} model run(s) scheduled"]
-        for fp, rt in zip(first_pitch_times, run_times):
-            lines.append(f"  First pitch {fp} → models run at {rt}")
-        notify_run_status("✅ 8 AM Schedule Analyzed", lines)
+        lines = [f"{len(game_times)} game(s) · {total_windows} model run(s) scheduled"]
+        for window_time, wgames in window_groups:
+            run_at   = (window_time - LEAD_TIME).astimezone().strftime("%-I:%M %p %Z")
+            fp_time  = window_time.astimezone().strftime("%-I:%M %p %Z")
+            lines.append(f"  First pitch {fp_time} → models run at {run_at} ({len(wgames)} game(s))")
+        notify_run_status("✅ 5 AM Schedule Analyzed", lines)
     except Exception as e:
         log(f"Status notification failed: {e}")
 
     now_utc = datetime.now(timezone.utc)
-    for i, window_time in enumerate(windows, 1):
+    for i, (window_time, window_game_times) in enumerate(window_groups, 1):
         run_at    = window_time - LEAD_TIME
         wait_secs = (run_at - now_utc).total_seconds()
 
         if wait_secs < -LEAD_TIME.total_seconds():
             # More than 90 min past first pitch — game is underway, skip
-            log(f"Window {i}/{len(windows)}: game already in progress — skipping.")
+            log(f"Window {i}/{total_windows}: game already in progress — skipping.")
             continue
 
         if wait_secs <= 0:
             # T-90 is now or just passed — run immediately
-            log(f"Window {i}/{len(windows)}: T-90 already passed — running immediately.")
-            run_models()
+            log(f"Window {i}/{total_windows}: T-90 already passed — running immediately.")
+            run_models(window_game_times)
         else:
             # Register a launchd job; this process can now exit cleanly
-            schedule_via_launchd(window_time, i, len(windows))
+            schedule_via_launchd(window_time, i, total_windows, window_game_times)
 
 
 if __name__ == "__main__":
