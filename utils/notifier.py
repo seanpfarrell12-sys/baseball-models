@@ -19,6 +19,9 @@ To get a Discord webhook URL:
 import json
 import argparse
 import requests
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from pathlib import Path
 from datetime import datetime
 
@@ -393,6 +396,50 @@ def send_daily_picks(results: dict, pick_date: str,
         print("  (notifier) Discord message sent.")
     else:
         print("  (notifier) Discord not configured — run: python3 utils/notifier.py --setup-discord")
+
+
+# =============================================================================
+# EMAIL — Grade evaluation report
+# =============================================================================
+
+def send_report_email(report_path: str, grade_date: str):
+    """
+    Send the grade evaluation report as a plain-text email via Gmail SMTP.
+
+    Parameters
+    ----------
+    report_path : str   Full path to the report .txt file
+    grade_date  : str   'YYYYMMDD' — used in the subject line
+    """
+    creds = _load_creds()
+    gmail       = creds.get("gmail")
+    app_password = creds.get("app_password")
+
+    if not gmail or not app_password:
+        print("  WARNING: Gmail credentials not found — skipping email.")
+        return
+
+    report_file = Path(report_path)
+    if not report_file.exists():
+        print(f"  WARNING: Report file not found at {report_path} — skipping email.")
+        return
+
+    body = report_file.read_text()
+    date_fmt = f"{grade_date[:4]}-{grade_date[4:6]}-{grade_date[6:]}"
+
+    msg = MIMEMultipart()
+    msg["From"]    = gmail
+    msg["To"]      = gmail
+    msg["Subject"] = f"⚾ Model Evaluation Report — {date_fmt}"
+    msg.attach(MIMEText(body, "plain"))
+
+    try:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+            server.login(gmail, app_password)
+            server.sendmail(gmail, gmail, msg.as_string())
+        print(f"  ✓ Evaluation report emailed to {gmail}")
+    except Exception as e:
+        print(f"  WARNING: Failed to send email — {e}")
 
 
 # =============================================================================

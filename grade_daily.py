@@ -7,6 +7,7 @@ Can also be run manually: python3 grade_daily.py
 =============================================================================
 """
 
+import os
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -227,5 +228,10 @@ Print a brief terminal summary (overall W-L-P, any 🔴 critical issues only).""
         ["claude", "-p", prompt],
         cwd=_BASE_DIR,
     )
+
+    # Email the report once the agent has written it
+    from utils.notifier import send_report_email
+    report_path = os.path.join(_BASE_DIR, "logs", f"grade_evaluation_{yesterday_str}.txt")
+    send_report_email(report_path, yesterday_str)
 else:
     print("  (claude CLI not found — skipping local evaluation agent)")
