@@ -52,7 +52,7 @@ MLB_TO_STANDARD = {
 PICKS_COLS = [
     "pick_date", "model", "game", "subject",
     "bet_type", "line", "odds", "model_prob", "edge",
-    "result", "actual", "pnl", "notes",
+    "result", "actual", "pnl", "pnl_50", "notes",
 ]
 
 
@@ -223,6 +223,7 @@ def save_picks(pick_date: str, results: dict):
             pick["result"]    = "PENDING"
             pick["actual"]    = None
             pick["pnl"]       = None
+            pick["pnl_50"]    = None
             pick["notes"]     = _get_note_for_date(pick_date)
             new_rows.append(pick)
 
@@ -363,11 +364,12 @@ def grade_picks(grade_date: str) -> int:
             result, actual = "ERROR", None
 
         if result in ("WIN", "LOSS", "PUSH"):
-            pnl = _american_pnl(row["odds"]) if result == "WIN" \
-                  else (0.0 if result == "PUSH" else -100.0)
+            pnl    = _american_pnl(row["odds"])        if result == "WIN" else (0.0 if result == "PUSH" else -100.0)
+            pnl_50 = _american_pnl(row["odds"], 50.0)  if result == "WIN" else (0.0 if result == "PUSH" else  -50.0)
             picks.at[idx, "result"] = result
             picks.at[idx, "actual"] = actual
             picks.at[idx, "pnl"]    = pnl
+            picks.at[idx, "pnl_50"] = pnl_50
             graded += 1
 
     _save_picks_df(picks)
