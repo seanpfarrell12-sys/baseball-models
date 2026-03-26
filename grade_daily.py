@@ -62,3 +62,31 @@ try:
         result.check_returncode()
 except Exception as e:
     print(f"  WARNING: git push failed — {e}")
+
+# ── Local model evaluation agent ──────────────────────────────────────────
+import shutil
+if shutil.which("claude"):
+    print("\n  Launching local model evaluation agent...")
+    prompt = f"""You are a baseball model performance analyst. Analyze the graded results from yesterday ({yesterday_str}) and provide a concise evaluation.
+
+Working directory: {_BASE_DIR}
+
+Steps:
+1. Read tracking/picks.xlsx — focus on the 'Season Results' sheet and each per-model sheet (Moneyline, Totals, Hitter TB, Pitcher Outs, NRFI-YRFI)
+2. Filter to picks from {yesterday_str} that have result WIN, LOSS, or PUSH
+3. For each model, report: picks made, W/L/P record, win rate, P&L at $100 flat stake
+4. Flag any model with win rate below 40% yesterday as a concern
+5. Read tracking/picks.xlsx 'Season Results' sheet and compute the same stats for the last 14 days across all models
+6. Compare yesterday's performance to the 14-day trend — is yesterday an outlier or consistent with recent form?
+7. Check if any model produced 0 picks yesterday — note whether that is expected (no edge found) or suspicious
+8. Write your findings to logs/grade_evaluation_{yesterday_str}.txt
+9. Print a brief summary to the terminal
+
+Be direct and specific. Focus on actionable observations, not general commentary."""
+
+    subprocess.run(
+        ["claude", "-p", prompt],
+        cwd=_BASE_DIR,
+    )
+else:
+    print("  (claude CLI not found — skipping local evaluation agent)")

@@ -16,7 +16,7 @@ exports/*
 exports/*/*
 !exports/*/*.xlsx
 
-# Logs — ignore verbose run logs, keep the summary for monitoring agents
+# Logs — ignore verbose run logs, keep the summary for remote monitoring agents
 logs/*
 !logs/last_run_summary.txt
 
