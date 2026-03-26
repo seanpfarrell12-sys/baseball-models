@@ -99,7 +99,14 @@ def _parse_outs(ip_str) -> int:
 
 def _load_picks() -> pd.DataFrame:
     if PICKS_FILE.exists():
-        return pd.read_excel(PICKS_FILE, engine="openpyxl")
+        df = pd.read_excel(PICKS_FILE, engine="openpyxl")
+        # Normalize pick_date — Excel may read it back as a datetime object.
+        # Always store and compare as YYYYMMDD string.
+        if "pick_date" in df.columns:
+            df["pick_date"] = pd.to_datetime(df["pick_date"], errors="coerce") \
+                                .dt.strftime("%Y%m%d") \
+                                .fillna(df["pick_date"].astype(str))
+        return df
     return pd.DataFrame(columns=PICKS_COLS)
 
 
