@@ -16,8 +16,9 @@ exports/*
 exports/*/*
 !exports/*/*.xlsx
 
-# Logs
-logs/
+# Logs — ignore verbose run logs, keep the summary for monitoring agents
+logs/*
+!logs/last_run_summary.txt
 
 # Raw and processed data — large files, pulled by 01_input scripts
 data/raw/

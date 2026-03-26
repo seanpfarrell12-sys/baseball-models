@@ -340,14 +340,16 @@ if __name__ == "__main__":
     ]
 
     results = {}
+    run_exceptions = {}   # name → traceback string for any model that crashed
     for name, fn in MODELS:
         section(name.upper())
         try:
             results[name] = fn()
         except Exception:
-            print(f"\n  ERROR running {name}:")
-            traceback.print_exc()
+            tb = traceback.format_exc()
+            print(f"\n  ERROR running {name}:\n{tb}")
             results[name] = None
+            run_exceptions[name] = tb
 
     # ── Error checks ──────────────────────────────────────────────────────
     section("ERROR CHECKS")
@@ -439,11 +441,41 @@ if __name__ == "__main__":
 
     print_performance_summary(n_days=30)
 
+    # ── Write run summary for monitoring agents ───────────────────────────
+    LOG_DIR = os.path.join(BASE_DIR, "logs")
+    os.makedirs(LOG_DIR, exist_ok=True)
+    summary_path = os.path.join(LOG_DIR, "last_run_summary.txt")
+    elapsed_final = (datetime.now() - start).seconds
+    with open(summary_path, "w") as f:
+        f.write(f"run_date:    {today_str}\n")
+        f.write(f"run_time:    {start.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"elapsed_sec: {elapsed_final}\n")
+        f.write(f"status:      {'ERROR' if run_exceptions else 'OK'}\n")
+        f.write("\n--- MODEL RESULTS ---\n")
+        for name, report in results.items():
+            if name in run_exceptions:
+                f.write(f"  {name:<16} EXCEPTION\n")
+            elif report is None:
+                f.write(f"  {name:<16} skipped / no data\n")
+            else:
+                n = int((report["is_value_bet"] == 1).sum()) \
+                    if "is_value_bet" in report.columns else "?"
+                f.write(f"  {name:<16} OK — {n} value bet(s)\n")
+        if error_warnings:
+            f.write("\n--- WARNINGS ---\n")
+            for w in error_warnings:
+                f.write(f"  {w}\n")
+        if run_exceptions:
+            f.write("\n--- EXCEPTIONS ---\n")
+            for name, tb in run_exceptions.items():
+                f.write(f"\n[{name}]\n{tb}\n")
+
     # ── Push exports and picks to GitHub for monitoring agents ────────────────
     import subprocess
     try:
         subprocess.run(
-            ["git", "add", f"exports/{today_str}/", "tracking/picks.xlsx"],
+            ["git", "add", f"exports/{today_str}/", "tracking/picks.xlsx",
+             "logs/last_run_summary.txt"],
             cwd=BASE_DIR, check=True, capture_output=True
         )
         result = subprocess.run(
