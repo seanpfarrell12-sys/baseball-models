@@ -223,56 +223,68 @@ def build_tb_edge_report(predictions_df: pd.DataFrame,
             == str(player_name).lower().strip()
         ] if not odds_df.empty else pd.DataFrame()
 
-        # Evaluate each standard prop line
-        prop_lines_to_eval = [0.5, 1.5, 2.5]
+        # Skip players with no real market odds
+        if player_odds.empty:
+            continue
 
-        for line in prop_lines_to_eval:
-            # Get model probabilities for this line
-            line_col_over  = f"p_over_line_{str(line).replace('.', '_')}"
-            line_col_under = f"p_under_line_{str(line).replace('.', '_')}"
+        # Select the consensus line: most books posting it (highest n_books),
+        # tiebreak by most balanced odds (closest to 50/50).
+        # Require at least 2 books; if none qualify, skip player.
+        player_odds = player_odds.copy()
+        if "n_books" in player_odds.columns:
+            qualified = player_odds[player_odds["n_books"] >= 2]
+            if qualified.empty:
+                continue
+            player_odds = qualified
 
-            model_p_over  = pred_row.get(line_col_over,  pred_row.get("p_over_main",  0.5))
-            model_p_under = pred_row.get(line_col_under, pred_row.get("p_under_main", 0.5))
+        def _over_prob(row):
+            d_over  = (row["over_juice"]  / 100 + 1) if row["over_juice"]  >= 0 else (1 - 100 / row["over_juice"])
+            d_under = (row["under_juice"] / 100 + 1) if row["under_juice"] >= 0 else (1 - 100 / row["under_juice"])
+            p_over_raw  = 1 / d_over
+            p_under_raw = 1 / d_under
+            total = p_over_raw + p_under_raw
+            return p_over_raw / total if total > 0 else 0.5
 
-            # Find market odds for this line
-            if not player_odds.empty:
-                line_odds = player_odds[
-                    abs(player_odds["prop_line"] - line) < 0.01
-                ]
-                if not line_odds.empty:
-                    over_juice  = line_odds["over_juice"].iloc[0]
-                    under_juice = line_odds["under_juice"].iloc[0]
-                else:
-                    # Use typical market juice as default
-                    over_juice  = -115.0  # Slight over juice (common for power hitters)
-                    under_juice = -105.0
-            else:
-                # No odds data — use standard juice
-                over_juice  = -110.0
-                under_juice = -110.0
+        player_odds["_p_over"] = player_odds.apply(_over_prob, axis=1)
+        player_odds["_balance"] = (player_odds["_p_over"] - 0.5).abs()
+        # Primary sort: most books; secondary sort: most balanced
+        player_odds = player_odds.sort_values(
+            ["n_books", "_balance"] if "n_books" in player_odds.columns else ["_balance"],
+            ascending=[False, True]
+        )
+        consensus_row = player_odds.iloc[0]
+        line       = float(consensus_row["prop_line"])
+        over_juice  = float(consensus_row["over_juice"])
+        under_juice = float(consensus_row["under_juice"])
 
-            # Fair market probabilities (remove vig)
-            fair_p_over, fair_p_under = remove_vig_props(over_juice, under_juice)
+        # Get model probabilities for the consensus line
+        line_col_over  = f"p_over_line_{str(line).replace('.', '_')}"
+        line_col_under = f"p_under_line_{str(line).replace('.', '_')}"
+        model_p_over  = pred_row.get(line_col_over,  pred_row.get("p_over_main",  0.5))
+        model_p_under = pred_row.get(line_col_under, pred_row.get("p_under_main", 0.5))
 
-            # Edges
-            over_edge  = round(model_p_over  - fair_p_over,  4)
-            under_edge = round(model_p_under - fair_p_under, 4)
+        # Fair market probabilities (remove vig)
+        fair_p_over, fair_p_under = remove_vig_props(over_juice, under_juice)
 
-            # Evaluate both Over and Under for this line
-            for bet_side, model_p, fair_p, juice, edge in [
-                ("OVER",  model_p_over,  fair_p_over,  over_juice,  over_edge),
-                ("UNDER", model_p_under, fair_p_under, under_juice, under_edge),
-            ]:
-                dec_odds = american_to_decimal(juice)
-                ev_pct   = calculate_ev_pct(model_p, dec_odds)
-                kelly    = kelly_criterion_props(model_p, dec_odds)
-                score    = compute_tb_edge_score(edge, ev_pct, kelly, expected_tb, line)
+        # Edges
+        over_edge  = round(model_p_over  - fair_p_over,  4)
+        under_edge = round(model_p_under - fair_p_under, 4)
 
-                # Skip clearly wrong directions (under on 0.5 is usually bad)
-                if bet_side == "UNDER" and line == 0.5 and model_p_over > 0.85:
-                    continue  # Don't recommend Under 0.5 if we project likely getting a hit
+        # Evaluate both Over and Under for the consensus line
+        for bet_side, model_p, fair_p, juice, edge in [
+            ("OVER",  model_p_over,  fair_p_over,  over_juice,  over_edge),
+            ("UNDER", model_p_under, fair_p_under, under_juice, under_edge),
+        ]:
+            dec_odds = american_to_decimal(juice)
+            ev_pct   = calculate_ev_pct(model_p, dec_odds)
+            kelly    = kelly_criterion_props(model_p, dec_odds)
+            score    = compute_tb_edge_score(edge, ev_pct, kelly, expected_tb, line)
 
-                rows.append({
+            # Skip clearly wrong directions (under on 0.5 is usually bad)
+            if bet_side == "UNDER" and line == 0.5 and model_p_over > 0.85:
+                continue  # Don't recommend Under 0.5 if we project likely getting a hit
+
+            rows.append({
                     "game_date":     pred_row.get("game_date", datetime.now().strftime("%Y-%m-%d")),
                     "player_name":   player_name,
                     "team":          team,
@@ -589,18 +601,24 @@ def score_live_hitters() -> pd.DataFrame:
     game_df["pa_adjustment"]        = game_df["batting_order_pos"].map(_PA_RATES) / _PA_MEAN
     game_df["adjusted_expected_tb"] = (game_df["expected_tb"] * game_df["pa_adjustment"]).round(3)
 
-    # Compute per-line probabilities using Poisson distribution.
-    # TB is a non-negative integer (0,1,2,...) — Poisson(lambda=adjusted_expected_tb)
-    # is a reasonable approximation. This converts E[TB] into the probabilities
-    # the edge report needs to compare against market implied odds.
-    from scipy.stats import poisson as _poisson
+    # Compute per-line probabilities using the geometric distribution
+    # (negative binomial with n=1).  TB per game is not Poisson-distributed —
+    # it has far more zero-TB games than Poisson predicts because a hitter
+    # can go hitless across all 3-4 at-bats.  The geometric distribution
+    # P(X=k) = p*(1-p)^k with p=1/(1+λ) matches market-implied probabilities
+    # much more closely than Poisson.
+    #
+    # Poisson(λ=1.71): P(0 TB) = 18%  ← badly wrong
+    # Geometric(λ=1.71): P(0 TB) = 37% ← matches market ~38%
+    from scipy.stats import nbinom as _nbinom
     for line in [0.5, 1.5, 2.5]:
         col_over  = f"p_over_line_{str(line).replace('.', '_')}"
         col_under = f"p_under_line_{str(line).replace('.', '_')}"
-        # P(TB > line) for half-point lines = P(TB >= ceil(line))
+        # P(TB > line) = P(TB >= ceil(line))
         k = int(np.floor(line))   # e.g. line=1.5 → k=1; P(over) = P(TB >= 2)
+        # nbinom(n=1, p=1/(1+λ)) is the geometric distribution with mean λ
         game_df[col_over]  = game_df["adjusted_expected_tb"].apply(
-            lambda lam: float(1 - _poisson.cdf(k, max(lam, 1e-9)))
+            lambda lam: float(1 - _nbinom.cdf(k, n=1, p=1.0 / (1.0 + max(lam, 1e-9))))
         )
         game_df[col_under] = 1.0 - game_df[col_over]
 

@@ -229,76 +229,92 @@ def build_pitcher_edge_report(predictions_df: pd.DataFrame,
             == str(pitcher_name).lower().strip()
         ] if not odds_df.empty else pd.DataFrame()
 
-        # Evaluate all standard prop lines
-        for line in STANDARD_OUTS_LINES:
-            # Get model probability for this specific line
-            line_col = f"line_{str(line).replace('.', '_')}"
-            p_over   = pred_row.get(f"p_over_{line_col}",  None)
-            p_under  = pred_row.get(f"p_under_{line_col}", None)
+        # Skip pitchers with no real market odds
+        if pitcher_odds.empty:
+            continue
 
-            # If specific line probs not stored, use normal approximation
-            if p_over is None or p_under is None:
-                from scipy import stats as sp_stats
-                sigma   = 3.5  # Typical outs/start std dev
-                z_score = (line - expected_outs) / sigma
-                p_under = float(sp_stats.norm.cdf(z_score))
-                p_over  = 1 - p_under
+        # Select the consensus line: most books posting it (highest n_books),
+        # tiebreak by most balanced odds (closest to 50/50).
+        # Require at least 2 books; if none qualify, skip pitcher.
+        pitcher_odds = pitcher_odds.copy()
+        if "n_books" in pitcher_odds.columns:
+            qualified = pitcher_odds[pitcher_odds["n_books"] >= 2]
+            if qualified.empty:
+                continue
+            pitcher_odds = qualified
 
-            # Look up market odds for this line
-            if not pitcher_odds.empty:
-                line_match = pitcher_odds[abs(pitcher_odds["prop_line"] - line) < 0.01]
-                if not line_match.empty:
-                    over_juice  = line_match["over_juice"].iloc[0]
-                    under_juice = line_match["under_juice"].iloc[0]
-                else:
-                    # No odds for this exact line — use -110/-110 standard
-                    over_juice  = -110.0
-                    under_juice = -110.0
-            else:
-                over_juice  = -110.0
-                under_juice = -110.0
+        def _over_prob_p(row):
+            d_over  = (row["over_juice"]  / 100 + 1) if row["over_juice"]  >= 0 else (1 - 100 / row["over_juice"])
+            d_under = (row["under_juice"] / 100 + 1) if row["under_juice"] >= 0 else (1 - 100 / row["under_juice"])
+            p_over_raw  = 1 / d_over
+            p_under_raw = 1 / d_under
+            total = p_over_raw + p_under_raw
+            return p_over_raw / total if total > 0 else 0.5
 
-            # Remove vig
-            fair_p_over, fair_p_under = remove_vig(over_juice, under_juice)
+        pitcher_odds["_p_over"] = pitcher_odds.apply(_over_prob_p, axis=1)
+        pitcher_odds["_balance"] = (pitcher_odds["_p_over"] - 0.5).abs()
+        # Primary sort: most books; secondary sort: most balanced
+        pitcher_odds = pitcher_odds.sort_values(
+            ["n_books", "_balance"] if "n_books" in pitcher_odds.columns else ["_balance"],
+            ascending=[False, True]
+        )
+        consensus_row = pitcher_odds.iloc[0]
+        line        = float(consensus_row["prop_line"])
+        over_juice  = float(consensus_row["over_juice"])
+        under_juice = float(consensus_row["under_juice"])
 
-            for bet_side, model_p, fair_p, juice in [
-                ("OVER",  p_over,  fair_p_over,  over_juice),
-                ("UNDER", p_under, fair_p_under, under_juice),
-            ]:
-                dec_odds = american_to_decimal(juice)
-                edge     = round(float(model_p) - float(fair_p), 4)
-                ev_pct   = calculate_ev_pct(float(model_p), dec_odds)
-                kelly    = kelly_pitcher(float(model_p), dec_odds)
-                score    = compute_pitcher_edge_score(
-                    edge, ev_pct, kelly, expected_outs, line, depth_score
-                )
+        # Get model probability for the consensus line
+        line_col = f"line_{str(line).replace('.', '_')}"
+        p_over   = pred_row.get(f"p_over_{line_col}",  None)
+        p_under  = pred_row.get(f"p_under_{line_col}", None)
+        if p_over is None or p_under is None:
+            from scipy import stats as sp_stats
+            sigma   = 3.5  # Typical outs/start std dev
+            z_score = (line - expected_outs) / sigma
+            p_under = float(sp_stats.norm.cdf(z_score))
+            p_over  = 1 - p_under
 
-                rows.append({
-                    "game_date":      pred_row.get("game_date",
-                                      datetime.now().strftime("%Y-%m-%d")),
-                    "pitcher_name":   pitcher_name,
-                    "team":           team,
-                    "opp_team":       opp_team,
-                    "bet_type":       f"{bet_side} {line} OUTS",
-                    "prop_line_outs": line,
-                    "prop_line_ip":   round(line / 3, 2),  # Display in IP too
-                    "bet_side":       bet_side,
-                    "expected_outs":  round(expected_outs, 2),
-                    "expected_ip":    round(expected_ip, 2),
-                    "manager_depth":  round(depth_score, 2),  # 0=pull-happy, 1=lets go deep
-                    "model_prob":     round(float(model_p), 4),
-                    "market_implied": round(float(fair_p), 4),
-                    "edge":           edge,
-                    "ev_pct":         ev_pct,
-                    "kelly_fraction": kelly,
-                    "edge_score":     score,
-                    "juice":          juice,
-                    "decimal_odds":   round(dec_odds, 4),
-                    "is_value_bet":   1 if edge >= MIN_EDGE and ev_pct > 0 else 0,
-                    # Explanatory columns for understanding the bet
-                    "outs_vs_line":   round(expected_outs - line, 2),  # Positive = lean Over
-                    "ip_vs_line":     round((expected_outs - line) / 3, 2),
-                })
+        # Remove vig
+        fair_p_over, fair_p_under = remove_vig(over_juice, under_juice)
+
+        for bet_side, model_p, fair_p, juice in [
+            ("OVER",  p_over,  fair_p_over,  over_juice),
+            ("UNDER", p_under, fair_p_under, under_juice),
+        ]:
+            dec_odds = american_to_decimal(juice)
+            edge     = round(float(model_p) - float(fair_p), 4)
+            ev_pct   = calculate_ev_pct(float(model_p), dec_odds)
+            kelly    = kelly_pitcher(float(model_p), dec_odds)
+            score    = compute_pitcher_edge_score(
+                edge, ev_pct, kelly, expected_outs, line, depth_score
+            )
+
+            rows.append({
+                "game_date":      pred_row.get("game_date",
+                                  datetime.now().strftime("%Y-%m-%d")),
+                "pitcher_name":   pitcher_name,
+                "team":           team,
+                "opp_team":       opp_team,
+                "bet_type":       f"{bet_side} {line} OUTS",
+                "prop_line_outs": line,
+                "prop_line_ip":   round(line / 3, 2),  # Display in IP too
+                "bet_side":       bet_side,
+                "expected_outs":  round(expected_outs, 2),
+                "expected_ip":    round(expected_ip, 2),
+                "manager_depth":  round(depth_score, 2),  # 0=pull-happy, 1=lets go deep
+                "model_prob":     round(float(model_p), 4),
+                "market_implied": round(float(fair_p), 4),
+                "edge":           edge,
+                "ev_pct":         ev_pct,
+                "kelly_fraction": kelly,
+                "edge_score":     score,
+                "juice":          juice,
+                "decimal_odds":   round(dec_odds, 4),
+                "is_value_bet":   1 if edge >= MIN_EDGE and ev_pct > 0 else 0,
+                # Explanatory columns for understanding the bet
+                "outs_vs_line":   round(expected_outs - line, 2),  # Positive = lean Over
+                "ip_vs_line":     round((expected_outs - line) / 3, 2),
+            })
 
     report_df = pd.DataFrame(rows)
     if not report_df.empty:

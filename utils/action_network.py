@@ -577,6 +577,7 @@ def _parse_props_v2(entries: list, players_map: dict, prop_type: str) -> pd.Data
             under_odds = sides["under"]
             if not over_odds and not under_odds:
                 continue
+            n_books = max(len(over_odds), len(under_odds))
 
             records.append({
                 "player_name":  player_name,
@@ -586,6 +587,7 @@ def _parse_props_v2(entries: list, players_map: dict, prop_type: str) -> pd.Data
                 "over_juice":   float(np.median(over_odds))  if over_odds  else -110.0,
                 "under_juice":  float(np.median(under_odds)) if under_odds else -110.0,
                 "book_name":    "Consensus",
+                "n_books":      n_books,
             })
 
     return pd.DataFrame(records) if records else pd.DataFrame()
