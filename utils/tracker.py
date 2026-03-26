@@ -103,6 +103,14 @@ def _load_picks() -> pd.DataFrame:
     return pd.DataFrame(columns=PICKS_COLS)
 
 
+MODEL_SHEETS = [
+    ("Moneyline",    "Moneyline"),
+    ("Totals",       "Totals"),
+    ("Hitter TB",    "Hitter TB"),
+    ("Pitcher Outs", "Pitcher Outs"),
+    ("NRFI/YRFI",    "NRFI-YRFI"),
+]
+
 def _save_picks_df(df: pd.DataFrame):
     graded = (
         df[df["result"].isin(["WIN", "LOSS", "PUSH"])]
@@ -110,8 +118,15 @@ def _save_picks_df(df: pd.DataFrame):
         .reset_index(drop=True)
     )
     with pd.ExcelWriter(PICKS_FILE, engine="openpyxl") as writer:
-        df.to_excel(writer, sheet_name="Picks", index=False)
+        df.to_excel(writer, sheet_name="All Picks", index=False)
         graded.to_excel(writer, sheet_name="Season Results", index=False)
+        for model_name, sheet_name in MODEL_SHEETS:
+            subset = (
+                df[df["model"] == model_name]
+                .sort_values("pick_date")
+                .reset_index(drop=True)
+            )
+            subset.to_excel(writer, sheet_name=sheet_name, index=False)
 
 
 # =============================================================================
@@ -218,11 +233,13 @@ def save_picks(pick_date: str, results: dict):
     new_df = pd.DataFrame(new_rows)[PICKS_COLS]
 
     existing = _load_picks()
-    # Drop any existing rows for this date (avoid duplicates on re-run)
-    if not existing.empty:
-        existing = existing[existing["pick_date"] != pick_date]
-
     combined = pd.concat([existing, new_df], ignore_index=True)
+
+    # Deduplicate: keep the first occurrence of each unique pick so earlier
+    # runs are preserved; only truly new picks from later runs are appended.
+    dedup_cols = ["pick_date", "model", "game", "subject", "bet_type", "line"]
+    combined = combined.drop_duplicates(subset=dedup_cols, keep="first")
+
     _save_picks_df(combined)
     print(f"  (tracker) Saved {len(new_rows)} value bets for {pick_date}")
 

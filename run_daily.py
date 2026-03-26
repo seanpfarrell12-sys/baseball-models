@@ -57,6 +57,118 @@ def section(title: str):
 
 
 # =============================================================================
+# ERROR CHECKS
+# =============================================================================
+
+MIN_EDGES = {
+    "Moneyline":    0.06,
+    "Totals O/U":   0.06,
+    "Hitter TB":    0.07,
+    "Pitcher Outs": 0.07,
+    "NRFI/YRFI":    0.06,
+}
+
+def run_error_checks(results: dict) -> list:
+    """
+    Sanity-check all model edge reports after a run.
+    Returns a list of warning strings — empty means no issues.
+    """
+    warnings = []
+
+    for name, report in results.items():
+        if report is None:
+            continue  # model skipped / no data — already logged during run
+
+        min_edge  = MIN_EDGES.get(name, 0.06)
+        value_bets = (
+            report[report["is_value_bet"] == 1]
+            if "is_value_bet" in report.columns
+            else pd.DataFrame()
+        )
+
+        # ── Edge threshold compliance ──────────────────────────────────────
+        if "edge" in value_bets.columns and not value_bets.empty:
+            below = value_bets[
+                pd.to_numeric(value_bets["edge"], errors="coerce") < min_edge
+            ]
+            if not below.empty:
+                warnings.append(
+                    f"⚠ {name}: {len(below)} value bet(s) below "
+                    f"{min_edge*100:.0f}% edge threshold"
+                )
+
+        # ── EV% outlier — live line contamination signal ───────────────────
+        for ev_col in ("ev_pct", "EV%", "ev"):
+            if ev_col in value_bets.columns:
+                outliers = value_bets[
+                    pd.to_numeric(value_bets[ev_col], errors="coerce").abs() > 500
+                ]
+                if not outliers.empty:
+                    warnings.append(
+                        f"🚨 {name}: EV% > 500% on {len(outliers)} pick(s) "
+                        f"— possible live line contamination"
+                    )
+                break
+
+        # ── Model-specific checks ──────────────────────────────────────────
+        if name == "Totals O/U":
+            if "ou_line" in report.columns:
+                fallback = report[
+                    pd.to_numeric(report["ou_line"], errors="coerce") == 8.5
+                ]
+                if not fallback.empty:
+                    warnings.append(
+                        f"⚠ Totals: {len(fallback)} game(s) with ou_line=8.5 "
+                        f"— odds join may have failed"
+                    )
+
+        elif name == "Hitter TB":
+            # Duplicate picks for same player
+            if "player_name" in value_bets.columns and not value_bets.empty:
+                dupes = value_bets[value_bets["player_name"].duplicated(keep=False)]
+                if not dupes.empty:
+                    warnings.append(
+                        f"⚠ Hitter TB: duplicate picks for "
+                        f"{dupes['player_name'].unique().tolist()}"
+                    )
+            # E[TB] out of realistic range
+            for col in ("expected_tb", "E_TB", "lambda_hat"):
+                if col in report.columns:
+                    vals = pd.to_numeric(report[col], errors="coerce")
+                    bad  = report[(vals < 0.5) | (vals > 2.5)]
+                    if not bad.empty:
+                        warnings.append(
+                            f"⚠ Hitter TB: {len(bad)} row(s) with {col} "
+                            f"outside 0.5–2.5 range"
+                        )
+                    break
+
+        elif name == "Pitcher Outs":
+            # Both starters from the same game both flagged — model bias signal
+            if "game" in value_bets.columns and not value_bets.empty:
+                dual = value_bets["game"].value_counts()
+                dual = dual[dual > 1]
+                if not dual.empty:
+                    warnings.append(
+                        f"⚠ Pitcher Outs: both starters flagged in "
+                        f"{len(dual)} game(s) — possible model bias: "
+                        f"{dual.index.tolist()}"
+                    )
+            # CSW% scaling bug — should be ~0.25–0.35, not 25–35
+            for col in ("csw_pct", "CSW%", "csw"):
+                if col in report.columns:
+                    scaled = report[pd.to_numeric(report[col], errors="coerce") > 10]
+                    if not scaled.empty:
+                        warnings.append(
+                            f"🚨 Pitcher Outs: CSW% looks like a percentage "
+                            f"(>10) in {len(scaled)} row(s) — scaling bug"
+                        )
+                    break
+
+    return warnings
+
+
+# =============================================================================
 # MODEL RUNNERS
 # =============================================================================
 
@@ -236,6 +348,21 @@ if __name__ == "__main__":
             print(f"\n  ERROR running {name}:")
             traceback.print_exc()
             results[name] = None
+
+    # ── Error checks ──────────────────────────────────────────────────────
+    section("ERROR CHECKS")
+    error_warnings = run_error_checks(results)
+    if error_warnings:
+        print(f"\n  {len(error_warnings)} issue(s) detected:")
+        for w in error_warnings:
+            print(f"    {w}")
+        try:
+            from utils.notifier import notify_run_status
+            notify_run_status("⚠️ Model Run — Issues Detected", error_warnings)
+        except Exception as e:
+            print(f"  WARNING: error notification failed — {e}")
+    else:
+        print("  ✓ All checks passed — no issues detected.")
 
     # ── Log model change note if provided ─────────────────────────────────
     if args.note:
