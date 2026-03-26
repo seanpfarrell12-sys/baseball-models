@@ -280,6 +280,18 @@ def pull_platoon_splits(years: list, min_pa: int = 50) -> tuple:
 # MAIN
 # =============================================================================
 if __name__ == "__main__":
+    # ── Season gate: extend training years once 20 games have been played ────
+    from utils.season_gate import season_gate_open
+    _games_played, _gate_open = season_gate_open(CURRENT_YEAR)
+    if _gate_open:
+        if CURRENT_YEAR not in GAME_YEARS:
+            GAME_YEARS.append(CURRENT_YEAR)
+        print(f"\n  [SEASON GATE] Open — {_games_played} games played "
+              f"→ {CURRENT_YEAR} added to training (GAME_YEARS={GAME_YEARS}).")
+    else:
+        print(f"\n  [SEASON GATE] Closed — {_games_played}/20 games played "
+              f"(threshold not met, training on {max(GAME_YEARS)} data only).")
+
     print("=" * 70)
     print("MONEYLINE MODEL — STEP 1: DATA INPUT (REFACTORED)")
     print(f"Stat years : {STAT_YEARS}")

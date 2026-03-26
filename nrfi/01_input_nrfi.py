@@ -60,8 +60,9 @@ BASE_DIR  = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RAW_DIR   = os.path.join(BASE_DIR, "data", "raw")
 os.makedirs(RAW_DIR, exist_ok=True)
 
-STAT_YEARS = [2022, 2023, 2024, 2025]
-GAME_YEARS = [2023, 2024, 2025]
+STAT_YEARS   = [2022, 2023, 2024, 2025]
+GAME_YEARS   = [2023, 2024, 2025]
+CURRENT_YEAR = _date.today().year          # 2026 — for in-season gate logic
 
 # MLB season months (April=4 through October=10)
 SEASON_MONTHS = list(range(4, 11))
@@ -535,6 +536,25 @@ def pull_ump_scorecards(game_years: list) -> pd.DataFrame:
 # MAIN
 # =============================================================================
 if __name__ == "__main__":
+    # ── Season gate: extend training years once 20 games have been played ────
+    from utils.season_gate import season_gate_open
+    _games_played, _gate_open = season_gate_open(CURRENT_YEAR)
+    if _gate_open:
+        if CURRENT_YEAR not in GAME_YEARS:
+            GAME_YEARS.append(CURRENT_YEAR)
+        if CURRENT_YEAR not in STAT_YEARS:
+            STAT_YEARS.append(CURRENT_YEAR)
+        # Always re-fetch current-year Statcast (grows daily during season)
+        _sc_cache = os.path.join(RAW_DIR, f"raw_nrfi_statcast_{CURRENT_YEAR}.csv")
+        if os.path.exists(_sc_cache):
+            os.remove(_sc_cache)
+        print(f"\n  [SEASON GATE] Open — {_games_played} games played "
+              f"→ {CURRENT_YEAR} added to training "
+              f"(GAME_YEARS={GAME_YEARS}, STAT_YEARS={STAT_YEARS}).")
+    else:
+        print(f"\n  [SEASON GATE] Closed — {_games_played}/20 games played "
+              f"(threshold not met, training on {max(GAME_YEARS)} data only).")
+
     print("=" * 70)
     print("NRFI / YRFI MODEL — STEP 1: DATA INPUT")
     print("=" * 70)
