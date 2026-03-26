@@ -1,15 +1,15 @@
 run_date:    20260326
-run_time:    2026-03-26 13:35:03
+run_time:    2026-03-26 14:40:00
 elapsed_sec: 61
 status:      OK
 
 --- MODEL RESULTS ---
   Moneyline        OK — 5 value bet(s)
   Totals O/U       OK — 10 value bet(s)
-  Hitter TB        OK — 27 value bet(s)
+  Hitter TB        OK — 21 value bet(s)
   Pitcher Outs     OK — 14 value bet(s)
   NRFI/YRFI        OK — 9 value bet(s)
 
 --- WARNINGS ---
   ⚠ Totals: 2 game(s) with ou_line=8.5 — odds join may have failed
-  ⚠ NRFI/YRFI: 2 value bet(s) below 6% edge threshold
+  ⚠ NRFI/YRFI: 3 value bet(s) below 6% edge threshold
