@@ -319,15 +319,23 @@ def build_pitcher_edge_report(predictions_df: pd.DataFrame,
     report_df = pd.DataFrame(rows)
     if not report_df.empty:
         report_df = report_df.sort_values("edge_score", ascending=False).reset_index(drop=True)
-        # Keep only the single best-scoring value bet per pitcher (max 1 pick per starter)
+        # Keep only the single best-scoring value bet per game (max 1 pick per matchup).
+        # Both starters showing an edge usually signals model bias, not two genuine
+        # market inefficiencies — take only the stronger signal.
+        game_key = report_df.apply(
+            lambda r: "_".join(sorted([str(r.get("team", "")), str(r.get("opp_team", ""))])),
+            axis=1,
+        )
+        report_df["_game_key"] = game_key
         best_idx = (
             report_df[report_df["is_value_bet"] == 1]
-            .groupby("pitcher_name")["edge_score"]
+            .groupby("_game_key")["edge_score"]
             .idxmax()
         )
         report_df["is_value_bet"] = 0
         if not best_idx.empty:
             report_df.loc[best_idx.values, "is_value_bet"] = 1
+        report_df = report_df.drop(columns=["_game_key"])
     return report_df
 
 
