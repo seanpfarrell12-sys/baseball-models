@@ -113,8 +113,11 @@ def _send_discord_results_raw(content: str):
     creds = _load_creds()
     url   = creds.get("discord_results_webhook")
     if not url:
+        print("  (notifier) Results channel not configured — run: python3 utils/notifier.py --setup-discord-results")
         return
-    requests.post(url, json={"content": content}, timeout=10)
+    resp = requests.post(url, json={"content": content}, timeout=10)
+    if resp.status_code not in (200, 204):
+        print(f"  (notifier) Discord results error {resp.status_code}: {resp.text[:200]}")
 
 
 def _notify_status_raw(content: str):
@@ -134,7 +137,9 @@ def _send_discord_results_embed(title: str, fields: list, footer: str = "", colo
     embed = {"title": title, "color": color or DISCORD_COLOR, "fields": fields}
     if footer:
         embed["footer"] = {"text": footer}
-    requests.post(url, json={"embeds": [embed]}, timeout=10)
+    resp = requests.post(url, json={"embeds": [embed]}, timeout=10)
+    if resp.status_code not in (200, 204):
+        print(f"  (notifier) Discord results embed error {resp.status_code}: {resp.text[:200]}")
 
 
 def _send_discord_embed(title: str, fields: list, footer: str = ""):
@@ -329,7 +334,7 @@ def _format_discord_results(grade_date: str) -> tuple:
         sub = day[day["model"] == model]
         if sub.empty:
             continue
-        lines = []
+        raw_lines = []
         for _, r in sub.iterrows():
             emoji  = RESULT_EMOJI.get(r["result"], "❓")
             actual = f" (actual: {r['actual']})" if pd.notna(r.get("actual")) else ""
@@ -338,10 +343,19 @@ def _format_discord_results(grade_date: str) -> tuple:
             if r["result"] == "LOSS":
                 pnl_r = -100
             pnl_str = f" ${pnl_r:+.0f}" if r["result"] != "PUSH" else " $0"
-            lines.append(f"{emoji} {r['subject']} {r['bet_type']}{actual}{pnl_str}")
+            raw_lines.append(f"{emoji} {r['subject']} {r['bet_type']}{actual}{pnl_str}")
+        # Truncate to Discord's 1024-char field limit
+        kept, remaining = [], len(raw_lines)
+        for line in raw_lines:
+            candidate = "\n".join(kept + [f"`{line}`"])
+            if len(candidate) > 980:
+                kept.append(f"*… +{remaining} more*")
+                break
+            kept.append(f"`{line}`")
+            remaining -= 1
         cfg = next((v for k, v in MODEL_CONFIGS.items() if v.get("sms_label") and model in k), {})
         emoji = cfg.get("emoji", "📌")
-        fields.append({"name": f"{emoji} {model}", "value": "\n".join(f"`{l}`" for l in lines), "inline": False})
+        fields.append({"name": f"{emoji} {model}", "value": "\n".join(kept), "inline": False})
 
     record = f"{wins}W-{losses}L" + (f"-{pushes}P" if pushes else "")
     footer = f"{record} | P&L: ${pnl:+.2f} (flat $100)"

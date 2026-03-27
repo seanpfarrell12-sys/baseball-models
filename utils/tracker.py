@@ -126,15 +126,64 @@ MODEL_SHEETS = [
     ("NRFI/YRFI",    "NRFI-YRFI"),
 ]
 
+def _build_summary(df: pd.DataFrame) -> pd.DataFrame:
+    """Build a W-L-P record + P&L summary across three windows."""
+    graded = df[df["result"].isin(["WIN", "LOSS", "PUSH"])].copy()
+    graded["pick_date"] = graded["pick_date"].astype(str)
+    graded["pnl_50"] = pd.to_numeric(graded["pnl_50"], errors="coerce").fillna(0)
+
+    today = date.today().strftime("%Y%m%d")
+    cutoff_30 = (date.today() - timedelta(days=30)).strftime("%Y%m%d")
+    cutoff_10 = (date.today() - timedelta(days=10)).strftime("%Y%m%d")
+
+    models = ["Moneyline", "Totals", "Hitter TB", "Pitcher Outs", "NRFI/YRFI"]
+    rows = []
+
+    for window_label, subset in [
+        ("Season",    graded),
+        ("Last 30d",  graded[graded["pick_date"] >= cutoff_30]),
+        ("Last 10d",  graded[graded["pick_date"] >= cutoff_10]),
+    ]:
+        for model in models:
+            sub = subset[subset["model"] == model]
+            w = int((sub["result"] == "WIN").sum())
+            l = int((sub["result"] == "LOSS").sum())
+            p = int((sub["result"] == "PUSH").sum())
+            total = w + l
+            win_pct = round(w / total, 3) if total > 0 else None
+            pnl_50 = round(sub["pnl_50"].sum(), 2)
+            rows.append({
+                "Window":  window_label,
+                "Model":   model,
+                "W":       w,
+                "L":       l,
+                "P":       p,
+                "Win%":    win_pct,
+                "P&L ($50 stake)": pnl_50,
+            })
+
+        # Totals row for the window
+        w = int((subset["result"] == "WIN").sum())
+        l = int((subset["result"] == "LOSS").sum())
+        p = int((subset["result"] == "PUSH").sum())
+        total = w + l
+        rows.append({
+            "Window":  window_label,
+            "Model":   "ALL",
+            "W":       w,
+            "L":       l,
+            "P":       p,
+            "Win%":    round(w / total, 3) if total > 0 else None,
+            "P&L ($50 stake)": round(subset["pnl_50"].sum(), 2),
+        })
+
+    return pd.DataFrame(rows, columns=["Window", "Model", "W", "L", "P", "Win%", "P&L ($50 stake)"])
+
+
 def _save_picks_df(df: pd.DataFrame):
-    graded = (
-        df[df["result"].isin(["WIN", "LOSS", "PUSH"])]
-        .sort_values(["pick_date", "model"])
-        .reset_index(drop=True)
-    )
     with pd.ExcelWriter(PICKS_FILE, engine="openpyxl") as writer:
         df.to_excel(writer, sheet_name="All Picks", index=False)
-        graded.to_excel(writer, sheet_name="Season Results", index=False)
+        _build_summary(df).to_excel(writer, sheet_name="Summary", index=False)
         for model_name, sheet_name in MODEL_SHEETS:
             subset = (
                 df[df["model"] == model_name]
@@ -396,18 +445,35 @@ def grade_picks(grade_date: str) -> int:
         return 0
 
     graded = 0
+    skipped_bad_odds = 0
     for idx in pending.index:
         row   = picks.loc[idx]
         model = row["model"]
+
+        # Flag picks with invalid American odds (must be >= 100 or <= -100)
+        try:
+            odds = float(row["odds"])
+            if pd.isna(odds) or abs(odds) < 100:
+                picks.at[idx, "result"] = "ODDS_ERR"
+                skipped_bad_odds += 1
+                continue
+        except (TypeError, ValueError):
+            picks.at[idx, "result"] = "ODDS_ERR"
+            skipped_bad_odds += 1
+            continue
+
         try:
             result, actual = _grade_row(row, model, game_scores, batter_tb, pitcher_outs_map, nrfi_results)
         except Exception as e:
             print(f"  (tracker) Error grading {model} pick '{row['subject']}': {e}")
             result, actual = "ERROR", None
 
-        if result in ("WIN", "LOSS", "PUSH"):
-            pnl    = _american_pnl(row["odds"])        if result == "WIN" else (0.0 if result == "PUSH" else -100.0)
-            pnl_50 = _american_pnl(row["odds"], 50.0)  if result == "WIN" else (0.0 if result == "PUSH" else  -50.0)
+        if result in ("WIN", "LOSS", "PUSH", "DNP"):
+            if result == "DNP":
+                pnl, pnl_50 = 0.0, 0.0
+            else:
+                pnl    = _american_pnl(row["odds"])        if result == "WIN" else (0.0 if result == "PUSH" else -100.0)
+                pnl_50 = _american_pnl(row["odds"], 50.0)  if result == "WIN" else (0.0 if result == "PUSH" else  -50.0)
             picks.at[idx, "result"] = result
             picks.at[idx, "actual"] = actual
             picks.at[idx, "pnl"]    = pnl
@@ -415,7 +481,8 @@ def grade_picks(grade_date: str) -> int:
             graded += 1
 
     _save_picks_df(picks)
-    print(f"  (tracker) Graded {graded} / {len(pending)} picks.")
+    bad_odds_note = f", {skipped_bad_odds} skipped (invalid odds)" if skipped_bad_odds else ""
+    print(f"  (tracker) Graded {graded} / {len(pending)} picks{bad_odds_note}.")
     return graded
 
 
@@ -426,9 +493,9 @@ def _grade_row(row, model, game_scores, batter_tb, pitcher_outs_map, nrfi_result
     elif model == "Totals":
         return _grade_totals(row, game_scores)
     elif model == "Hitter TB":
-        return _grade_prop(row, batter_tb)
+        return _grade_prop(row, batter_tb, game_scores)
     elif model == "Pitcher Outs":
-        return _grade_prop(row, pitcher_outs_map)
+        return _grade_prop(row, pitcher_outs_map, game_scores)
     elif model == "NRFI/YRFI":
         return _grade_nrfi(row, nrfi_results or {})
     return "PENDING", None
@@ -476,7 +543,7 @@ def _grade_totals(row, game_scores):
     return result, total
 
 
-def _grade_prop(row, stat_map):
+def _grade_prop(row, stat_map, game_scores=None):
     """Grade an OVER/UNDER prop (TB or outs)."""
     subject  = str(row["subject"])
     line     = float(row["line"]) if row["line"] is not None else None
@@ -487,6 +554,15 @@ def _grade_prop(row, stat_map):
 
     match = _best_name_match(subject, list(stat_map.keys()))
     if match is None:
+        # If the game is final but the player has no box score entry, they DNP
+        if game_scores is not None:
+            game_str = str(row.get("game", ""))
+            parts = [p for p in re.split(r"[@\s]+", game_str.replace("vs", " ")) if p]
+            if len(parts) >= 2:
+                team1, team2 = parts[0], parts[-1]
+                for key in game_scores:
+                    if team1 in key and team2 in key:
+                        return "DNP", None
         return "PENDING", None
 
     actual = stat_map[match]
@@ -551,7 +627,7 @@ def _fetch_mlb_results(api_date: str):
     # Step 1: get gamePks, final scores, and linescore (first-inning runs)
     resp = requests.get(
         MLB_SCHEDULE_URL,
-        params={"sportId": 1, "date": api_date, "hydrate": "linescore"},
+        params={"sportId": 1, "date": api_date, "hydrate": "linescore,team"},
         timeout=20,
     )
     resp.raise_for_status()
