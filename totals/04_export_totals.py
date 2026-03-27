@@ -51,6 +51,7 @@ from utils.probable_starters import (get_games_with_sp_stats,
                                       get_lineup_batting_features,
                                       get_lineups,
                                       load_batting_stats)
+from utils.bullpen import get_bullpen_availability
 
 # --- Configuration ----------------------------------------------------------
 BASE_DIR   = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -286,9 +287,15 @@ def score_live_games_totals(odds_df: pd.DataFrame) -> pd.DataFrame:
     import joblib
     import statsmodels.api as sm
 
-    model = joblib.load(os.path.join(MODEL_DIR, "totals_model.pkl"))
+    model_home = joblib.load(os.path.join(MODEL_DIR, "totals_nb_home.pkl"))
+    model_away = joblib.load(os.path.join(MODEL_DIR, "totals_nb_away.pkl"))
     with open(os.path.join(MODEL_DIR, "totals_features.json")) as f:
-        feature_cols = json.load(f)
+        feat_cfg   = json.load(f)
+    home_feats = feat_cfg["home_features"] if isinstance(feat_cfg, dict) else feat_cfg
+    away_feats = feat_cfg.get("away_features", feat_cfg) if isinstance(feat_cfg, dict) else feat_cfg
+    alpha_home = feat_cfg.get("alpha_home", 0.001) if isinstance(feat_cfg, dict) else 0.001
+    alpha_away = feat_cfg.get("alpha_away", 0.001) if isinstance(feat_cfg, dict) else 0.001
+    feature_cols = list(dict.fromkeys(home_feats + away_feats))  # all unique features
 
     # ── Fetch individual SP stats ──────────────────────────────────────────
     print("  Fetching today's probable starters (individual stats)...")
@@ -319,12 +326,60 @@ def score_live_games_totals(odds_df: pd.DataFrame) -> pd.DataFrame:
     pit = pit[pit["Season"] == pit_season]
     pit_map = {r["Team"]: r for _, r in pit.iterrows()}
 
+    # Bullpen: compute per-team BP stats from raw_sp_stats.csv (GS < 5, IP >= 5)
+    _FG_TO_STD = {
+        "SFG": "SF", "WSN": "WSH", "SDP": "SD", "KCR": "KC",
+        "TBR": "TB", "CHW": "CWS",
+    }
+    bp_map = {}
+    try:
+        sp_raw = pd.read_csv(os.path.join(RAW_DIR, "raw_sp_stats.csv"))
+        sp_raw = sp_raw[sp_raw["Season"] == pit_season].copy()
+        sp_raw["IP"] = pd.to_numeric(sp_raw["IP"], errors="coerce").fillna(0)
+        if "Team" in sp_raw.columns:
+            sp_raw["team_std"] = sp_raw["Team"].map(_FG_TO_STD).fillna(sp_raw["Team"])
+        gs_col = sp_raw["GS"].fillna(0) if "GS" in sp_raw.columns else pd.Series(0, index=sp_raw.index)
+        rp = sp_raw[(gs_col < 5) & (sp_raw["IP"] >= 5)]
+        if not rp.empty and "team_std" in rp.columns:
+            for team, grp in rp.groupby("team_std"):
+                tw = grp["IP"].sum()
+                if tw > 0:
+                    bp_map[team] = {
+                        "bp_era":   (grp["ERA"].fillna(4.5) * grp["IP"]).sum() / tw if "ERA" in grp.columns else np.nan,
+                        "bp_k_pct": (grp["K%"].fillna(0.22) * grp["IP"]).sum() / tw if "K%" in grp.columns else np.nan,
+                        "bp_fip":   (grp["FIP"].fillna(4.5) * grp["IP"]).sum() / tw if "FIP" in grp.columns else np.nan,
+                    }
+    except Exception as _e:
+        print(f"  WARNING: Bullpen computation failed — {_e}")
+
+    # Bullpen availability (recent workload from MLB Stats API)
+    print("  Fetching bullpen availability (last 3 days)...")
+    try:
+        bp_avail = get_bullpen_availability(game_date)
+    except Exception as _e:
+        print(f"  WARNING: Bullpen availability fetch failed — {_e}")
+        bp_avail = {}
+
     park = pd.read_csv(os.path.join(RAW_DIR, "raw_park_factors.csv"))
     park_map = {r["team"]: r for _, r in park.iterrows()}
 
-    train_means = pd.read_csv(
-        os.path.join(PROC_DIR, "totals_dataset.csv")
-    )[feature_cols].mean()
+    # Manager hook rates
+    mgr_map = {}
+    _mgr_path = os.path.join(RAW_DIR, "raw_manager_hook.csv")
+    if os.path.exists(_mgr_path):
+        try:
+            _mgr = pd.read_csv(_mgr_path)
+            for _, _mr in _mgr.iterrows():
+                _team = _mr.get("Team", _mr.get("team", None))
+                _hr   = _mr.get("hook_rate", _mr.get("HookRate", np.nan))
+                if _team:
+                    mgr_map[str(_team)] = float(_hr) if pd.notna(_hr) else np.nan
+        except Exception as _me:
+            print(f"  WARNING: Could not load manager hook rates — {_me}")
+
+    _ds = pd.read_csv(os.path.join(PROC_DIR, "totals_dataset.csv"))
+    _avail = [c for c in feature_cols if c in _ds.columns]
+    train_means = _ds[_avail].mean()
 
     rows = []
     for _, game in odds_df.iterrows():
@@ -380,28 +435,99 @@ def score_live_games_totals(odds_df: pd.DataFrame) -> pd.DataFrame:
             "sp_source":             sp_source,
             "bat_source_home":       bat_source_home,
             "bat_source_away":       bat_source_away,
+            # Backward-compat old column names
             "home_team_off_woba":    hlb.get("off_woba", h_bat_fallback.get("wOBA", np.nan)),
             "home_team_off_iso":     hlb.get("off_iso",  h_bat_fallback.get("ISO",  np.nan)),
-            "home_team_pit_era":     h_pit.get("ERA",  np.nan),
-            "home_team_pit_xfip":    h_pit.get("xFIP", np.nan),
-            "home_sp_siera":         home_sp_siera,
-            "home_sp_k_pct":         home_sp_k_pct,
+            "home_team_pit_era":     h_pit.get("ERA",  np.nan) if isinstance(h_pit, dict) else getattr(h_pit, "ERA",  np.nan),
+            "home_team_pit_xfip":    h_pit.get("xFIP", np.nan) if isinstance(h_pit, dict) else getattr(h_pit, "xFIP", np.nan),
             "away_team_off_woba":    alb.get("off_woba", a_bat_fallback.get("wOBA", np.nan)),
             "away_team_off_iso":     alb.get("off_iso",  a_bat_fallback.get("ISO",  np.nan)),
-            "away_team_pit_era":     a_pit.get("ERA",  np.nan),
-            "away_team_pit_xfip":    a_pit.get("xFIP", np.nan),
+            "away_team_pit_era":     a_pit.get("ERA",  np.nan) if isinstance(a_pit, dict) else getattr(a_pit, "ERA",  np.nan),
+            "away_team_pit_xfip":    a_pit.get("xFIP", np.nan) if isinstance(a_pit, dict) else getattr(a_pit, "xFIP", np.nan),
+            # New batting columns
+            "home_off_woba":         hlb.get("off_woba",    h_bat_fallback.get("wOBA", np.nan)),
+            "home_off_iso":          hlb.get("off_iso",     h_bat_fallback.get("ISO",  np.nan)),
+            "home_off_wrcplus":      float(hlb.get("off_wrc_plus", h_bat_fallback.get("wRC+", 100.0)) or 100.0),
+            "home_off_k_pct":        float(hlb.get("off_k_pct",   h_bat_fallback.get("K%",   0.22))  or 0.22),
+            "home_off_bb_pct":       float(hlb.get("off_bb_pct",  h_bat_fallback.get("BB%",  0.085)) or 0.085),
+            "home_off_obp":          float(hlb.get("off_obp",     h_bat_fallback.get("OBP",  0.32))  or 0.32),
+            "home_off_slg":          float(hlb.get("off_slg",     h_bat_fallback.get("SLG",  0.40))  or 0.40),
+            "away_off_woba":         alb.get("off_woba",    a_bat_fallback.get("wOBA", np.nan)),
+            "away_off_iso":          alb.get("off_iso",     a_bat_fallback.get("ISO",  np.nan)),
+            "away_off_wrcplus":      float(alb.get("off_wrc_plus", a_bat_fallback.get("wRC+", 100.0)) or 100.0),
+            "away_off_k_pct":        float(alb.get("off_k_pct",   a_bat_fallback.get("K%",   0.22))  or 0.22),
+            "away_off_bb_pct":       float(alb.get("off_bb_pct",  a_bat_fallback.get("BB%",  0.085)) or 0.085),
+            "away_off_obp":          float(alb.get("off_obp",     a_bat_fallback.get("OBP",  0.32))  or 0.32),
+            "away_off_slg":          float(alb.get("off_slg",     a_bat_fallback.get("SLG",  0.40))  or 0.40),
+            # New pitching columns (new naming)
+            "home_pit_era":          float(h_pit.get("ERA",   np.nan) if isinstance(h_pit, dict) else getattr(h_pit, "ERA",   np.nan)),
+            "home_pit_xfip":         float(h_pit.get("xFIP",  np.nan) if isinstance(h_pit, dict) else getattr(h_pit, "xFIP",  np.nan)),
+            "home_pit_fip":          float(h_pit.get("FIP",   np.nan) if isinstance(h_pit, dict) else getattr(h_pit, "FIP",   np.nan)),
+            "home_pit_siera":        float(h_pit.get("SIERA", np.nan) if isinstance(h_pit, dict) else getattr(h_pit, "SIERA", np.nan)),
+            "home_pit_k_pct":        float(h_pit.get("K%",    np.nan) if isinstance(h_pit, dict) else getattr(h_pit, "K%",    np.nan)),
+            "home_pit_bb_pct":       float(h_pit.get("BB%",   np.nan) if isinstance(h_pit, dict) else getattr(h_pit, "BB%",   np.nan)),
+            "home_pit_k_bb_pct":     float(h_pit.get("K-BB%", np.nan) if isinstance(h_pit, dict) else getattr(h_pit, "K-BB%", np.nan)),
+            "away_pit_era":          float(a_pit.get("ERA",   np.nan) if isinstance(a_pit, dict) else getattr(a_pit, "ERA",   np.nan)),
+            "away_pit_xfip":         float(a_pit.get("xFIP",  np.nan) if isinstance(a_pit, dict) else getattr(a_pit, "xFIP",  np.nan)),
+            "away_pit_fip":          float(a_pit.get("FIP",   np.nan) if isinstance(a_pit, dict) else getattr(a_pit, "FIP",   np.nan)),
+            "away_pit_siera":        float(a_pit.get("SIERA", np.nan) if isinstance(a_pit, dict) else getattr(a_pit, "SIERA", np.nan)),
+            "away_pit_k_pct":        float(a_pit.get("K%",    np.nan) if isinstance(a_pit, dict) else getattr(a_pit, "K%",    np.nan)),
+            "away_pit_bb_pct":       float(a_pit.get("BB%",   np.nan) if isinstance(a_pit, dict) else getattr(a_pit, "BB%",   np.nan)),
+            "away_pit_k_bb_pct":     float(a_pit.get("K-BB%", np.nan) if isinstance(a_pit, dict) else getattr(a_pit, "K-BB%", np.nan)),
+            # SP columns
+            "home_sp_siera":         home_sp_siera,
+            "home_sp_k_pct":         home_sp_k_pct,
+            "home_sp_xfip":          float(sp_row.get("home_sp_xfip",    np.nan)) if sp_row is not None else np.nan,
+            "home_sp_fip":           float(sp_row.get("home_sp_fip",     np.nan)) if sp_row is not None else np.nan,
+            "home_sp_era":           float(sp_row.get("home_sp_era",     np.nan)) if sp_row is not None else np.nan,
+            "home_sp_bb_pct":        float(sp_row.get("home_sp_bb_pct",  np.nan)) if sp_row is not None else np.nan,
+            "home_sp_k_bb_pct":      float(sp_row.get("home_sp_k_bb_pct", np.nan)) if sp_row is not None else np.nan,
+            "home_sp_gb_pct":        float(sp_row.get("home_sp_gb_pct",  np.nan)) if sp_row is not None else np.nan,
             "away_sp_siera":         away_sp_siera,
             "away_sp_k_pct":         away_sp_k_pct,
+            "away_sp_xfip":          float(sp_row.get("away_sp_xfip",    np.nan)) if sp_row is not None else np.nan,
+            "away_sp_fip":           float(sp_row.get("away_sp_fip",     np.nan)) if sp_row is not None else np.nan,
+            "away_sp_era":           float(sp_row.get("away_sp_era",     np.nan)) if sp_row is not None else np.nan,
+            "away_sp_bb_pct":        float(sp_row.get("away_sp_bb_pct",  np.nan)) if sp_row is not None else np.nan,
+            "away_sp_k_bb_pct":      float(sp_row.get("away_sp_k_bb_pct", np.nan)) if sp_row is not None else np.nan,
+            "away_sp_gb_pct":        float(sp_row.get("away_sp_gb_pct",  np.nan)) if sp_row is not None else np.nan,
+            # Bullpen features
+            "home_bp_era":           bp_map.get(home, {}).get("bp_era",   train_means.get("home_bp_era",   4.30)),
+            "home_bp_k_pct":         bp_map.get(home, {}).get("bp_k_pct", train_means.get("home_bp_k_pct", 0.245)),
+            "home_bp_fip":           bp_map.get(home, {}).get("bp_fip",   train_means.get("home_bp_fip",   4.20)),
+            "away_bp_era":           bp_map.get(away, {}).get("bp_era",   train_means.get("away_bp_era",   4.30)),
+            "away_bp_k_pct":         bp_map.get(away, {}).get("bp_k_pct", train_means.get("away_bp_k_pct", 0.245)),
+            "away_bp_fip":           bp_map.get(away, {}).get("bp_fip",   train_means.get("away_bp_fip",   4.20)),
+            # Legacy combined/diff features
             "combined_sp_siera":     (home_sp_siera + away_sp_siera) / 2 if both_sp else np.nan,
+            "diff_sp_siera":         home_sp_siera - away_sp_siera if both_sp else np.nan,
+            # Stadium/park features (new naming)
             "home_park_factor":      pk.get("pf_runs", 100) if isinstance(pk, dict) else getattr(pk, "pf_runs", 100),
+            "base_pf":               pk.get("pf_runs", 100) if isinstance(pk, dict) else getattr(pk, "pf_runs", 100),
             "altitude":              _ALTITUDE_MAP.get(home, 0),
+            "altitude_ft":           _ALTITUDE_MAP.get(home, 0),
             "is_coors":              1 if home == "COL" else 0,
             "home_covered":          home_covered,
             "home_artificial":       home_artificial,
+            "is_artificial":         home_artificial,
+            "is_dome":               1.0 if (pk.get("roof", "") if isinstance(pk, dict) else getattr(pk, "roof", "")) == "fixed" else 0.0,
+            # Manager hook rates
+            "home_hook_rate":        mgr_map.get(home, np.nan),
+            "away_hook_rate":        mgr_map.get(away, np.nan),
+            # Weather defaults (no live weather feed)
             "temperature_f":         72,
+            "wx_temperature_f":      72.0,
+            "wx_humidity_pct":       60.0,
+            "wx_wind_speed_mph":     8.0,
+            "wx_wind_direction_deg": 180.0,
             "is_hot_game":           0,
             "is_cold_game":          0,
-            "diff_sp_siera":         home_sp_siera - away_sp_siera if both_sp else np.nan,
+            # Dynamic park factors (default neutral)
+            "dyn_pf":                1.0,
+            "dyn_temp_factor":       1.0,
+            "dyn_humidity_factor":   1.0,
+            "dyn_wind_factor":       1.0,
+            "wind_outfield_comp":    0.0,
         }
         rows.append(row)
 
@@ -413,8 +539,44 @@ def score_live_games_totals(odds_df: pd.DataFrame) -> pd.DataFrame:
         else:
             game_df[col] = train_means.get(col, 0.0)
 
-    X = sm.add_constant(game_df[feature_cols], has_constant="add")
-    game_df["lambda_hat"] = model.predict(exog=X).round(3)
+    def _aligned_predict(model, feats, df):
+        """Predict with column alignment in case model dropped multicollinear features."""
+        X = sm.add_constant(df[feats].astype(float), has_constant="add")
+        if hasattr(model, "params") and len(model.params) != X.shape[1]:
+            fitted_cols = list(model.model.exog_names) if hasattr(model.model, "exog_names") \
+                          else list(model.params.index)
+            for c in fitted_cols:
+                if c not in X.columns:
+                    X[c] = 0.0
+            X = X[fitted_cols]
+        return np.asarray(model.predict(exog=X), dtype=float)
+
+    mu_home = _aligned_predict(model_home, home_feats, game_df)
+    mu_away = _aligned_predict(model_away, away_feats, game_df)
+    game_df["lambda_home_runs"] = np.round(mu_home, 3)
+    game_df["lambda_away_runs"] = np.round(mu_away, 3)
+    game_df["lambda_hat"] = (mu_home + mu_away).round(3)
+
+    # Apply bullpen availability adjustments (post-model lambda scaling)
+    # A taxed home bullpen → away team may score more runs (and vice versa)
+    # We track home_lambda / away_lambda separately then recombine as lambda_hat
+    if bp_avail:
+        game_df["home_lambda"] = game_df["lambda_hat"] / 2.0
+        game_df["away_lambda"] = game_df["lambda_hat"] / 2.0
+        for idx, row in game_df.iterrows():
+            h = row["home_team"]
+            a = row["away_team"]
+            # Taxed home bullpen → away team scores more
+            home_adj = bp_avail.get(h, {}).get("bp_adjustment", 1.0)
+            # Taxed away bullpen → home team scores more
+            away_adj = bp_avail.get(a, {}).get("bp_adjustment", 1.0)
+            game_df.at[idx, "away_lambda"] = row["away_lambda"] * home_adj
+            game_df.at[idx, "home_lambda"] = row["home_lambda"] * away_adj
+            if home_adj > 1.0 or away_adj > 1.0:
+                print(f"  BP adjustment: {a} @ {h} "
+                      f"(home_bp_adj={home_adj:.2f}, away_bp_adj={away_adj:.2f})")
+        game_df["lambda_hat"] = (game_df["home_lambda"] + game_df["away_lambda"]).round(3)
+        game_df.drop(columns=["home_lambda", "away_lambda"], inplace=True)
 
     n_ind = (game_df.get("sp_source", pd.Series()) == "individual").sum()
     print(f"  ✓ Scored {len(game_df)} games ({n_ind} with individual SP stats). "

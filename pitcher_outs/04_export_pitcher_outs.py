@@ -529,6 +529,9 @@ def score_live_pitchers() -> pd.DataFrame:
             feats["opp_lg_avg_obp"] = float(
                 opp_lb.get("off_obp",
                 opp_bat.get("OBP",  train_means.get("opp_lg_avg_obp",   0.316))))
+            feats["opp_lg_avg_bb_pct"] = float(
+                opp_lb.get("off_bb_pct",
+                opp_bat.get("BB%", train_means.get("opp_lg_avg_bb_pct", 0.085))))
 
             rows.append({
                 "game_date":       game.get("game_time", date.today().isoformat())[:10],

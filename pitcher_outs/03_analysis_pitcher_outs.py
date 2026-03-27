@@ -141,7 +141,7 @@ TI_FEAT_COLS = [
     "swstr_pct", "fstrike_pct", "csw_pct", "avg_fb_velo",
     "xwoba_against", "barrel_pct",
     "pitches_per_pa", "effective_ppp",
-    "opp_bb_pct", "opp_k_pct", "opp_wrc_plus", "opp_obp",
+    "opp_lg_avg_bb_pct", "opp_lg_avg_k_pct", "opp_wrc_plus", "opp_lg_avg_obp",
     "typical_pc_limit", "hard_pc_limit", "ttop_hook_rate",
     "depth_score", "mgr_avg_sp_outs",
     "est_pc_at_bf18", "pc_fraction_at_bf18",
@@ -359,7 +359,8 @@ def simulate_sp_outing(hazard_model: xgb.XGBClassifier,
 
     Returns a dict with the full outs distribution + O/U probabilities.
     """
-    opp_obp       = float(game_context.get("opp_obp",         0.315))
+    opp_obp       = float(game_context.get("opp_lg_avg_obp",
+                                            game_context.get("opp_obp", 0.315)))
     p_out_per_bf  = max(0.50, min(0.90, 1.0 - opp_obp))
     eff_ppp       = float(game_context.get("effective_ppp",
                                             game_context.get("pitches_per_pa", 3.75)))
@@ -667,6 +668,34 @@ if __name__ == "__main__":
     imp_df.to_csv(imp_path, index=False)
     print(f"  ✓ Feature importances : {imp_path}")
 
+    # ── Simple XGBRegressor companion (used by 04_export_pitcher_outs.py) ─────
+    print("\n  Training simple XGBRegressor companion (for 04_export scoring)...")
+    _reg_feats = [c for c in TI_FEAT_COLS
+                  if c in starts_df.columns
+                  and pd.api.types.is_numeric_dtype(starts_df[c])
+                  and c not in {"effective_ppp", "typical_pc_limit", "hard_pc_limit",
+                                "ttop_hook_rate", "mgr_avg_sp_outs", "opp_wrc_plus",
+                                "bp_gmLI", "bp_total_apps", "est_pc_at_bf18",
+                                "pc_fraction_at_bf18", "pc_headroom_at_ttop",
+                                "efficiency_x_depth", "pitches_per_pa"}]
+    _X = starts_df[_reg_feats].fillna(starts_df[_reg_feats].mean()).astype(float)
+    _y = starts_df["outs_recorded"].astype(float)
+    _mask = _y.notna()
+    _reg = xgb.XGBRegressor(n_estimators=300, learning_rate=0.05, max_depth=5,
+                             subsample=0.8, colsample_bytree=0.8, random_state=42)
+    _reg.fit(_X[_mask], _y[_mask], verbose=False)
+    _reg_path = os.path.join(MODEL_DIR, "pitcher_outs_model.json")
+    _reg.save_model(_reg_path)
+    print(f"  ✓ Regression companion : {_reg_path}")
+    # Update features JSON to export-compatible feature list
+    with open(feat_path, "w") as f:
+        json.dump(_reg_feats, f)
+    print(f"  ✓ Features JSON updated: {_reg_feats}")
+    # Save per-start dataset for export fallback means
+    _ds = starts_df[_reg_feats + ["outs_recorded"]].copy()
+    _ds.to_csv(os.path.join(PROC_DIR, "pitcher_outs_dataset.csv"), index=False)
+    print(f"  ✓ pitcher_outs_dataset.csv updated")
+
     # Save simulation results for review
     sim_path = os.path.join(PROC_DIR, "pitcher_outs_sim_eval.csv")
     sim_df.to_csv(sim_path, index=False)
@@ -680,7 +709,7 @@ if __name__ == "__main__":
             "k_pct": 29.0, "bb_pct": 6.5, "k_minus_bb_pct": 22.5,
             "siera": 2.90, "xfip": 3.10, "swstr_pct": 14.0, "csw_pct": 32.0,
             "avg_fb_velo": 96.5, "pitches_per_pa": 3.60, "effective_ppp": 3.65,
-            "opp_bb_pct": 0.095, "opp_wrc_plus": 108, "opp_obp": 0.325,
+            "opp_lg_avg_bb_pct": 0.095, "opp_wrc_plus": 108, "opp_lg_avg_obp": 0.325,
             "typical_pc_limit": 93,  "hard_pc_limit": 103,
             "ttop_hook_rate": 0.37, "depth_score": 0.50,
             "mgr_avg_sp_outs": 14.5, "est_pc_at_bf18": 65.7,
@@ -694,7 +723,7 @@ if __name__ == "__main__":
             "k_pct": 22.0, "bb_pct": 8.0, "k_minus_bb_pct": 14.0,
             "siera": 4.10, "xfip": 3.90, "swstr_pct": 10.5, "csw_pct": 27.0,
             "avg_fb_velo": 93.0, "pitches_per_pa": 3.80, "effective_ppp": 3.90,
-            "opp_bb_pct": 0.082, "opp_wrc_plus": 98, "opp_obp": 0.310,
+            "opp_lg_avg_bb_pct": 0.082, "opp_wrc_plus": 98, "opp_lg_avg_obp": 0.310,
             "typical_pc_limit": 80,  "hard_pc_limit": 90,   # Kevin Cash
             "ttop_hook_rate": 0.75, "depth_score": 0.30,
             "mgr_avg_sp_outs": 12.5, "est_pc_at_bf18": 70.2,

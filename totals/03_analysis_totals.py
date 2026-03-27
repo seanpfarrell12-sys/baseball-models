@@ -272,6 +272,15 @@ def predict_nb2(result, alpha: float, X_new: pd.DataFrame) -> np.ndarray:
     """
     X_const = sm.add_constant(X_new.fillna(X_new.mean()).astype(float),
                                has_constant="add")
+    # Align prediction matrix with the model's actual fitted parameters
+    # (Poisson fallback may drop multicollinear columns, reducing param count)
+    if hasattr(result, "params") and len(result.params) != X_const.shape[1]:
+        fitted_cols = list(result.model.exog_names) if hasattr(result.model, "exog_names") \
+                      else list(result.params.index)
+        missing = [c for c in fitted_cols if c not in X_const.columns]
+        for c in missing:
+            X_const[c] = 0.0
+        X_const = X_const[fitted_cols]
     return np.asarray(result.predict(X_const), dtype=float)
 
 

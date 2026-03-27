@@ -1,8 +1,26 @@
 {
-  "cv_mae": 3.512133967704248,
-  "cv_rmse": 4.418826356734776,
-  "cv_corr": 0.131608021815888,
-  "test_mae": 3.689232833508024,
-  "test_rmse": 4.681859326423133,
-  "test_corr": 0.028215425067996885
+  "model_family": "NegativeBinomial_NB2",
+  "two_equations": true,
+  "alpha_home": 0.001,
+  "alpha_away": 0.001,
+  "holdout_season": 2025,
+  "holdout_mae_total": 3.632048136501276,
+  "holdout_rmse_total": 4.5900618469288235,
+  "holdout_r_total": 0.14847390020650755,
+  "mc_simulations": 200000,
+  "cv_folds": [
+    {
+      "fold": "train<2025 / test=2025",
+      "n_train": 4697,
+      "n_test": 2268,
+      "mae_home": 2.5127,
+      "mae_away": 2.8326,
+      "mae_total": 3.9377,
+      "r_home": 0.0151,
+      "r_away": 0.1123,
+      "r_total": 0.0607,
+      "alpha_home": 0.001,
+      "alpha_away": 0.001
+    }
+  ]
 }

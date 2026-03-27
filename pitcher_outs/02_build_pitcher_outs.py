@@ -359,10 +359,10 @@ def build_opponent_lookup(team_bat: pd.DataFrame) -> dict:
         team = str(row["team_std"])
         yr   = int(row.get("Season", row.get("season", 2025)))
         opp_lookup[(team, yr)] = {
-            "opp_bb_pct":   float(row.get("bb_pct", row.get("BB%", 0.085))),
-            "opp_k_pct":    float(row.get("k_pct",  row.get("K%",  0.230))),
-            "opp_wrc_plus": float(row.get("wRC+", row.get("wrc_plus", 100.0))),
-            "opp_obp":      float(row.get("OBP", row.get("obp", 0.315))),
+            "opp_lg_avg_bb_pct": float(row.get("bb_pct", row.get("BB%", 0.085))),
+            "opp_lg_avg_k_pct":  float(row.get("k_pct",  row.get("K%",  0.230))),
+            "opp_wrc_plus":      float(row.get("wRC+", row.get("wrc_plus", 100.0))),
+            "opp_lg_avg_obp":    float(row.get("OBP", row.get("obp", 0.315))),
         }
 
     print(f"    Opponent lookup: {len(opp_lookup):,} (team, season) entries")
@@ -533,16 +533,16 @@ def build_per_start_dataset(starts: list,
             all_opp = [v for (t, s), v in opp_lookup.items() if s == season]
             if all_opp:
                 opp_feat = {
-                    "opp_bb_pct":   np.mean([x["opp_bb_pct"]  for x in all_opp]),
-                    "opp_k_pct":    np.mean([x["opp_k_pct"]   for x in all_opp]),
-                    "opp_wrc_plus": np.mean([x["opp_wrc_plus"] for x in all_opp]),
-                    "opp_obp":      np.mean([x["opp_obp"]      for x in all_opp]),
+                    "opp_lg_avg_bb_pct": np.mean([x["opp_lg_avg_bb_pct"] for x in all_opp]),
+                    "opp_lg_avg_k_pct":  np.mean([x["opp_lg_avg_k_pct"]  for x in all_opp]),
+                    "opp_wrc_plus":      np.mean([x["opp_wrc_plus"]       for x in all_opp]),
+                    "opp_lg_avg_obp":    np.mean([x["opp_lg_avg_obp"]     for x in all_opp]),
                 }
 
         # Pitch count accumulation rate:
         # how many pitches does this SP throw per PA? × how often does opponent walk?
         pitches_per_pa = float(sp_feat.get("pitches_per_pa", 3.75))
-        opp_bb_pct     = float(opp_feat.get("opp_bb_pct",   0.085))
+        opp_bb_pct     = float(opp_feat.get("opp_lg_avg_bb_pct", 0.085))
 
         # Effective pitches per PA: SP base rate + 15% extra for high-walk lineups
         # Rationale: walks add pitch-count without recording outs.  A walk-heavy
@@ -580,10 +580,10 @@ def build_per_start_dataset(starts: list,
             "effective_ppp":       effective_ppp,
 
             # Opponent features
-            "opp_bb_pct":          float(opp_feat.get("opp_bb_pct",      0.085)),
-            "opp_k_pct":           float(opp_feat.get("opp_k_pct",       0.230)),
-            "opp_wrc_plus":        float(opp_feat.get("opp_wrc_plus",   100.0)),
-            "opp_obp":             float(opp_feat.get("opp_obp",         0.315)),
+            "opp_lg_avg_bb_pct":   float(opp_feat.get("opp_lg_avg_bb_pct", 0.085)),
+            "opp_lg_avg_k_pct":    float(opp_feat.get("opp_lg_avg_k_pct",  0.230)),
+            "opp_wrc_plus":        float(opp_feat.get("opp_wrc_plus",      100.0)),
+            "opp_lg_avg_obp":      float(opp_feat.get("opp_lg_avg_obp",    0.315)),
 
             # Manager hazard features
             "typical_pc_limit":    typical_pc_limit,
@@ -665,7 +665,7 @@ def expand_to_bf_level(starts_df: pd.DataFrame) -> pd.DataFrame:
 
     for _, row in starts_df.iterrows():
         outs   = row.get("outs_recorded", np.nan)
-        opp_obp = float(row.get("opp_obp", LEAGUE_AVG_OUT_RATE))
+        opp_obp = float(row.get("opp_lg_avg_obp", LEAGUE_AVG_OUT_RATE))
         out_rate = max(0.5, min(0.85, 1.0 - opp_obp))  # P(out per BF)
 
         # Estimate observed BF from outs
