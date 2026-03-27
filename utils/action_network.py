@@ -649,6 +649,7 @@ def fetch_all_props_today(prop_type: str = "batter_total_bases",
 
         props = fetch_player_props(str(game_id), prop_type=prop_type, token=token)
         if not props.empty:
+            props["game_time"] = game_row.get("game_time", "")
             props["home_team"] = home_team
             props["away_team"] = away_team
             props["game_id"]   = game_id
@@ -681,7 +682,7 @@ def get_moneyline_odds(game_date: str = None, token: str = None) -> pd.DataFrame
     if df.empty:
         return df
 
-    result = df[["home_team", "away_team", "home_ml", "away_ml",
+    result = df[["game_time", "home_team", "away_team", "home_ml", "away_ml",
                  "public_home_bet_pct", "public_away_bet_pct"]].copy()
     result = result.rename(columns={
         "home_ml": "home_odds_american",
@@ -702,7 +703,7 @@ def get_totals_odds(game_date: str = None, token: str = None) -> pd.DataFrame:
     if df.empty:
         return df
 
-    result = df[["home_team", "away_team", "ou_line",
+    result = df[["game_time", "home_team", "away_team", "ou_line",
                  "over_juice", "under_juice"]].copy()
     result = result.dropna(subset=["ou_line"])
     return result

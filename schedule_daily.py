@@ -94,7 +94,7 @@ def log(msg: str):
 
 
 def cleanup_stale_run_plists():
-    """Unload and delete run plists from previous days."""
+    """Unload and delete run plists and sentinels from previous days."""
     today_str = datetime.now().strftime("%Y%m%d")
     for plist in AGENTS_DIR.glob(f"{RUN_LABEL_PREFIX}*.plist"):
         # Stem: com.baseballmodels.run.YYYYMMDDHHMM
@@ -103,6 +103,12 @@ def cleanup_stale_run_plists():
             subprocess.run(["launchctl", "unload", str(plist)], capture_output=True)
             plist.unlink()
             log(f"Cleaned up stale plist: {plist.name}")
+    for sentinel in LOG_DIR.glob("window_ran_*.done"):
+        # Filename: window_ran_YYYYMMDD_HHMM.done
+        date_part = sentinel.stem.replace("window_ran_", "")[:8]
+        if date_part < today_str:
+            sentinel.unlink()
+            log(f"Cleaned up stale sentinel: {sentinel.name}")
 
 
 def schedule_via_launchd(window_time: datetime, index: int, total: int,
@@ -174,6 +180,14 @@ def schedule_via_launchd(window_time: datetime, index: int, total: int,
 
 def run_models(window_game_times: list = None):
     """Run run_daily.py immediately, optionally scoped to a specific game window."""
+    # Guard: skip if this window's sentinel already exists (run already completed).
+    if window_game_times:
+        run_at_local = (min(window_game_times) - LEAD_TIME).astimezone()
+        sentinel = LOG_DIR / f"window_ran_{run_at_local.strftime('%Y%m%d_%H%M')}.done"
+        if sentinel.exists():
+            log(f"Window already processed (sentinel: {sentinel.name}) — skipping.")
+            return
+
     log("Launching run_daily.py immediately (T-90 already passed)...")
     cmd = [sys.executable, str(BASE_DIR / "run_daily.py")]
     if window_game_times:

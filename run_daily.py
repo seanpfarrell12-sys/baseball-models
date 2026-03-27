@@ -23,6 +23,7 @@ import importlib.util
 import traceback
 import pandas as pd
 from datetime import datetime, date, timedelta, timezone
+from pathlib import Path
 
 BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
 today_str  = datetime.now().strftime("%Y%m%d")
@@ -54,6 +55,18 @@ if args.window_games:
         print(f"  WARNING: could not parse --window-games: {_e}")
 
 WINDOW_GAP = timedelta(minutes=30)   # ±30 min tolerance when filtering odds
+
+# Sentinel file — prevents duplicate runs if the scheduler fires more than once
+# for the same window (e.g. on machine reboot or manual re-invocation).
+_LEAD_TIME_MIN = 90
+_sentinel_path: Path | None = None
+if WINDOW_GAME_TIMES:
+    _run_at_utc   = min(WINDOW_GAME_TIMES) - timedelta(minutes=_LEAD_TIME_MIN)
+    _run_at_local = _run_at_utc.astimezone()
+    _sentinel_path = (
+        Path(BASE_DIR) / "logs"
+        / f"window_ran_{_run_at_local.strftime('%Y%m%d_%H%M')}.done"
+    )
 
 
 def load_export_module(subdir: str, filename: str):
@@ -107,8 +120,11 @@ def _filter_to_window(df: pd.DataFrame) -> pd.DataFrame:
 
     mask     = df[time_col].apply(_in_window)
     filtered = df[mask]
-    # Safety net: if filter removed everything, fall back to full set
-    return filtered if not filtered.empty else df
+    if filtered.empty:
+        print(f"  WARNING: window filter removed all rows from '{time_col}' column "
+              f"— returning empty set (check game time format or odds fetch)")
+        return filtered
+    return filtered
 
 
 def _get_window_label() -> str:
@@ -418,6 +434,27 @@ def _collect_window_game_names(results: dict) -> list:
 
 
 if __name__ == "__main__":
+    # Guard: if this window was already processed today, do not run again.
+    if _sentinel_path and _sentinel_path.exists():
+        print(f"Window already processed (sentinel: {_sentinel_path.name}) — "
+              f"skipping duplicate run.")
+        sys.exit(0)
+
+    # Guard: if the game window has already started, skip.
+    # This catches launchd firing a missed T-90 plist after the machine wakes
+    # from sleep — the plist fires at wake time regardless of how late it is.
+    if WINDOW_GAME_TIMES:
+        _now_utc     = datetime.now(timezone.utc)
+        _first_pitch = min(WINDOW_GAME_TIMES)
+        if _now_utc >= _first_pitch:
+            print(
+                f"Game window already started at "
+                f"{_first_pitch.astimezone().strftime('%-I:%M %p %Z')} "
+                f"(now {_now_utc.astimezone().strftime('%-I:%M %p %Z')}) — "
+                f"skipping late-wake run."
+            )
+            sys.exit(0)
+
     start = datetime.now()
     window_label = _get_window_label()
     header = f"  DAILY MODEL RUN — {start.strftime('%A, %B %d, %Y')}"
@@ -581,6 +618,11 @@ if __name__ == "__main__":
             f.write("\n--- EXCEPTIONS ---\n")
             for name, tb in run_exceptions.items():
                 f.write(f"\n[{name}]\n{tb}\n")
+
+    # ── Write sentinel so the scheduler won't re-run this window ─────────────
+    if _sentinel_path:
+        _sentinel_path.parent.mkdir(exist_ok=True)
+        _sentinel_path.write_text(f"ran: {start.isoformat()}\n")
 
     # ── Push exports and picks to GitHub for monitoring agents ────────────────
     import subprocess
