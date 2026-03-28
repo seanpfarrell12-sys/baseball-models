@@ -15,7 +15,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 from utils.tracker  import grade_picks
-from utils.notifier import send_graded_results
+from utils.notifier import send_graded_results, notify_run_status
 
 SEASON_START  = datetime(2026, 3, 25)
 yesterday_str = (datetime.now() - timedelta(days=1)).strftime("%Y%m%d")
@@ -33,9 +33,13 @@ n_graded = grade_picks(yesterday_str)
 
 if n_graded > 0:
     send_graded_results(yesterday_str)
+    notify_run_status(
+        "📋 4 AM Grader — Complete",
+        [f"Graded {n_graded} picks from {yesterday_str[:4]}-{yesterday_str[4:6]}-{yesterday_str[6:]}",
+         "Results posted to Discord results channel."],
+    )
 else:
     print("  No picks to grade or results not yet final.")
-    from utils.notifier import notify_run_status
     notify_run_status("📋 4 AM Grader — No Results",
                       ["No picks from yesterday to grade, or results not yet final."])
 
