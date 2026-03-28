@@ -24,6 +24,7 @@ import traceback
 import pandas as pd
 from datetime import datetime, date, timedelta, timezone
 from pathlib import Path
+from typing import Optional
 
 BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
 today_str  = datetime.now().strftime("%Y%m%d")
@@ -59,7 +60,7 @@ WINDOW_GAP = timedelta(minutes=30)   # ±30 min tolerance when filtering odds
 # Sentinel file — prevents duplicate runs if the scheduler fires more than once
 # for the same window (e.g. on machine reboot or manual re-invocation).
 _LEAD_TIME_MIN = 90
-_sentinel_path: Path | None = None
+_sentinel_path = None  # type: Optional[Path]
 if WINDOW_GAME_TIMES:
     _run_at_utc   = min(WINDOW_GAME_TIMES) - timedelta(minutes=_LEAD_TIME_MIN)
     _run_at_local = _run_at_utc.astimezone()
