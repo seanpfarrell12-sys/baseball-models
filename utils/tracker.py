@@ -23,6 +23,7 @@ import re
 import json
 import difflib
 import unicodedata
+import subprocess
 import requests
 import pandas as pd
 import numpy as np
@@ -32,7 +33,6 @@ from datetime import date, timedelta, datetime
 BASE_DIR       = Path(__file__).parent.parent
 TRACKING_DIR   = BASE_DIR / "tracking"
 PICKS_FILE     = TRACKING_DIR / "picks.xlsx"
-CHANGELOG_FILE = TRACKING_DIR / "changelog.json"
 
 TRACKING_DIR.mkdir(exist_ok=True)
 
@@ -52,8 +52,17 @@ MLB_TO_STANDARD = {
 PICKS_COLS = [
     "pick_date", "model", "game", "subject",
     "bet_type", "line", "odds", "model_prob", "edge",
-    "result", "actual", "pnl", "pnl_50", "notes",
+    "result", "actual", "pnl", "pnl_50", "git_commits",
 ]
+
+# Keywords used to decide if a git commit is relevant to a model
+_MODEL_KEYWORDS = {
+    "Moneyline":    ["moneyline", "ml model", "ml bug"],
+    "Totals":       ["totals", " total", "over/under", " ou "],
+    "Hitter TB":    ["hitter", " tb ", "total base"],
+    "Pitcher Outs": ["pitcher", "outs", "pitcher_outs"],
+    "NRFI/YRFI":    ["nrfi", "yrfi"],
+}
 
 
 # =============================================================================
@@ -194,61 +203,60 @@ def _save_picks_df(df: pd.DataFrame):
 
 
 # =============================================================================
-# CHANGELOG
+# GIT COMMIT LOOKUP
 # =============================================================================
 
-def log_model_change(description: str, change_date: str = None):
+def _get_git_commits_for_model(model_name: str, pick_date: str) -> str:
     """
-    Record a model change so it appears in the notes column for picks saved
-    on or after this date.
+    Return a semicolon-separated string of git commit messages from the 14 days
+    leading up to pick_date that are relevant to model_name.
 
-    Parameters
-    ----------
-    description : str  — what changed, e.g. "Added PA multiplier to hitter TB"
-    change_date : str  — 'YYYYMMDD', defaults to today
+    Relevance: commit message (lowercased) contains at least one of the model's
+    keywords, OR contains generic model/fix/bug terms with no model-specific
+    match (shown to all models as a catch-all).
 
-    Example
-    -------
-    from utils.tracker import log_model_change
-    log_model_change("Added batting order position PA multiplier to hitter TB model")
+    Skips automated daily-picks and graded-results commits.
     """
-    if change_date is None:
-        change_date = date.today().strftime("%Y%m%d")
+    try:
+        # Convert YYYYMMDD → YYYY-MM-DD for git --before / --after
+        d = pick_date[:8]
+        before = f"{d[:4]}-{d[4:6]}-{d[6:]}T23:59:59"
+        after_dt = date(int(d[:4]), int(d[4:6]), int(d[6:])) - timedelta(days=14)
+        after = after_dt.strftime("%Y-%m-%dT00:00:00")
 
-    changelog = _load_changelog()
-    # Append to existing entry for this date if one already exists
-    if change_date in changelog and changelog[change_date]:
-        changelog[change_date] = changelog[change_date] + "; " + description
-    else:
-        changelog[change_date] = description
+        result = subprocess.run(
+            ["git", "-C", str(BASE_DIR), "log",
+             f"--after={after}", f"--before={before}",
+             "--pretty=format:%s"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode != 0:
+            return ""
 
-    CHANGELOG_FILE.write_text(json.dumps(changelog, indent=2, sort_keys=True))
-    print(f"  (tracker) Changelog updated for {change_date}: {description}")
-
-
-def _load_changelog() -> dict:
-    """Return {YYYYMMDD: note_str} dict."""
-    if CHANGELOG_FILE.exists():
-        return json.loads(CHANGELOG_FILE.read_text())
-    return {}
-
-
-def _get_note_for_date(pick_date: str) -> str:
-    """
-    Return the most recent changelog entry on or before pick_date.
-    Empty string if none exists.
-    """
-    changelog = _load_changelog()
-    if not changelog:
+        lines = [l.strip() for l in result.stdout.splitlines() if l.strip()]
+    except Exception:
         return ""
-    # All dates on or before pick_date, sorted descending — take the most recent
-    candidates = sorted(
-        (d for d in changelog if d <= pick_date),
-        reverse=True,
-    )
-    if not candidates:
-        return ""
-    return changelog[candidates[0]]
+
+    # Skip automated operational commits
+    _SKIP_PREFIXES = ("daily picks:", "graded results:", "graded result:")
+
+    keywords = _MODEL_KEYWORDS.get(model_name, [])
+    _GENERIC = ["fix", "bug", "model", "refactor", "update", "add ", "improve"]
+
+    relevant = []
+    for msg in lines:
+        low = msg.lower()
+        if any(low.startswith(p) for p in _SKIP_PREFIXES):
+            continue
+        if any(kw in low for kw in keywords):
+            relevant.append(msg)
+        elif any(g in low for g in _GENERIC) and not any(
+            kw in low for kws in _MODEL_KEYWORDS.values() for kw in kws
+        ):
+            # Generic engineering commit not tied to any specific model — show to all
+            relevant.append(msg)
+
+    return "; ".join(relevant)
 
 
 # =============================================================================
@@ -294,12 +302,12 @@ def save_picks(pick_date: str, results: dict):
         value_bets = report[report["is_value_bet"] == 1] if "is_value_bet" in report.columns else report
         for _, row in value_bets.iterrows():
             pick = extractor(row)
-            pick["pick_date"] = pick_date
-            pick["result"]    = "PENDING"
-            pick["actual"]    = None
-            pick["pnl"]       = None
-            pick["pnl_50"]    = None
-            pick["notes"]     = _get_note_for_date(pick_date)
+            pick["pick_date"]   = pick_date
+            pick["result"]      = "PENDING"
+            pick["actual"]      = None
+            pick["pnl"]         = None
+            pick["pnl_50"]      = None
+            pick["git_commits"] = _get_git_commits_for_model(model_name, pick_date)
             new_rows.append(pick)
 
     if not new_rows:
