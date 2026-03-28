@@ -319,6 +319,9 @@ def build_pitcher_edge_report(predictions_df: pd.DataFrame,
     report_df = pd.DataFrame(rows)
     if not report_df.empty:
         report_df = report_df.sort_values("edge_score", ascending=False).reset_index(drop=True)
+        # Keep only the highest-edge bet per pitcher per day (prevents double-picking same pitcher)
+        report_df = report_df.drop_duplicates(subset=["pitcher_name", "game_date"], keep="first")
+        report_df = report_df.reset_index(drop=True)
     return report_df
 
 

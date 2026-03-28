@@ -549,6 +549,11 @@ def score_live_games_totals(odds_df: pd.DataFrame) -> pd.DataFrame:
                 if c not in X.columns:
                     X[c] = 0.0
             X = X[fitted_cols]
+        bad_cols = [c for c in X.columns if not np.isfinite(X[c]).all()]
+        if bad_cols:
+            print(f"  WARNING: Non-finite values in feature columns: {bad_cols}")
+            for c in bad_cols:
+                X[c] = np.nan_to_num(X[c], nan=0.0, posinf=0.0, neginf=0.0)
         return np.asarray(model.predict(exog=X), dtype=float)
 
     mu_home = _aligned_predict(model_home, home_feats, game_df)
@@ -625,6 +630,12 @@ def build_totals_edge_report(predictions_df: pd.DataFrame,
 
         lambda_hat = float(lambda_hat)
         ou_line    = float(ou_line)
+
+        if not np.isfinite(lambda_hat) or lambda_hat <= 0:
+            home = row.get("home_team", "?")
+            away = row.get("away_team", "?")
+            print(f"  SKIP: Invalid lambda_hat ({lambda_hat}) for {away} @ {home} — skipping game.")
+            continue
 
         # Compute p_over/p_under from lambda_hat + Poisson distribution
         # This handles both the old predictions CSV path and the new live scoring path

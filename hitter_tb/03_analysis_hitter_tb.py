@@ -97,6 +97,26 @@ def load_data(path: str) -> tuple:
         if c not in exclude and pd.api.types.is_numeric_dtype(df[c])
     ]
 
+    print(f"  Training columns ({len(feature_cols)}): {feature_cols}")
+
+    # Leakage check: flag any column that looks like a same-game actual
+    LEAKAGE_KEYWORDS = {"_1b", "_2b", "_3b", "_hr", "_hit", "_ab", "_rbi",
+                        "_tb", "_run", "total_base", "actual", "n_ab", "n_hit"}
+    suspect = [c for c in feature_cols if any(kw in c.lower() for kw in LEAKAGE_KEYWORDS)]
+    if suspect:
+        print(f"  LEAKAGE WARNING: Possible same-game actuals in features: {suspect}")
+    else:
+        print("  Leakage check: no suspicious same-game actuals detected in features.")
+
+    # Scale check: whiff percentages should be 0–1 (Statcast returns 0–100)
+    for col in ["sp_fb_whiff_pct", "sp_os_whiff_pct"]:
+        if col in df.columns:
+            max_val = df[col].max()
+            if max_val > 1.0:
+                print(f"  SCALE WARNING: {col} max={max_val:.1f} — expected 0–1, "
+                      f"dividing by 100.")
+                df[col] = df[col] / 100.0
+
     X = df[feature_cols].copy()
     y = df["tb_actual"].astype(int).copy()
     return X, y, df, feature_cols

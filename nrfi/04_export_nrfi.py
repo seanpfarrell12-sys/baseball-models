@@ -807,8 +807,8 @@ def run_nrfi_export(target_date: str = None, verbose: bool = True) -> pd.DataFra
         df.at[idx, "edge_yrfi"] = round(edge_yrfi, 4)
         df.at[idx, "edge_nrfi"] = round(edge_nrfi, 4)
 
-        # Best side
-        if abs(edge_yrfi) >= abs(edge_nrfi) and abs(edge_yrfi) >= MIN_EDGE:
+        # Best side — only bet positive edges above MIN_EDGE
+        if edge_yrfi >= MIN_EDGE and edge_yrfi >= edge_nrfi:
             bet_side  = "YRFI"
             bet_juice = float(yrfi_j)
             bet_prob  = p_yrfi
@@ -817,7 +817,7 @@ def run_nrfi_export(target_date: str = None, verbose: bool = True) -> pd.DataFra
             df.at[idx, "bet_odds"]  = bet_juice
             df.at[idx, "ev_pct"]    = ev_percent(bet_prob, true_p_yrfi, dec_odds)
             df.at[idx, "kelly_bet"] = kelly_bet(edge_yrfi, bet_prob, dec_odds)
-        elif abs(edge_nrfi) >= MIN_EDGE:
+        elif edge_nrfi >= MIN_EDGE:
             bet_side  = "NRFI"
             bet_juice = float(nrfi_j)
             bet_prob  = p_nrfi
