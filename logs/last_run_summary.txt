@@ -1,16 +1,15 @@
-run_date:    20260328
-run_time:    2026-03-28 20:10:01
-elapsed_sec: 90
+run_date:    20260329
+run_time:    2026-03-29 12:05:02
+elapsed_sec: 77
 status:      OK
 
 --- MODEL RESULTS ---
-  Moneyline        OK — 1 value bet(s)
-  Totals O/U       OK — 2 value bet(s)
-  Hitter TB        OK — 9 value bet(s)
-  Pitcher Outs     OK — 2 value bet(s)
-  NRFI/YRFI        OK — 15 value bet(s)
+  Moneyline        OK — 4 value bet(s)
+  Totals O/U       OK — 6 value bet(s)
+  Hitter TB        OK — 24 value bet(s)
+  Pitcher Outs     OK — 16 value bet(s)
+  NRFI/YRFI        OK — 9 value bet(s)
 
 --- WARNINGS ---
-  ⚠ Totals: 2 game(s) with ou_line=8.5 — odds join may have failed
   ⚠ Hitter TB: 2 row(s) with expected_tb outside 0.5–2.5 range
-  🚨 NRFI/YRFI: EV% > 500% on 1 pick(s) — possible live line contamination
+  🚨 NRFI/YRFI: EV% > 500% on 4 pick(s) — possible live line contamination
